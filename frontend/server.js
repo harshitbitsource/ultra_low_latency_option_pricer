@@ -1,5 +1,6 @@
 import express from "express";
 import fs from "fs";
+import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -11,6 +12,81 @@ const port = process.env.PORT ? Number(process.env.PORT) : 5174;
 const repoRoot = path.resolve(__dirname, "..");
 const cppDir = path.join(repoRoot, "cpp");
 const binaryPath = path.join(cppDir, "option_pricer");
+
+const nseAgent = new https.Agent({
+  minVersion: "TLSv1.2",
+  maxVersion: "TLSv1.2",
+  rejectUnauthorized: false,
+});
+
+async function fetchNseQuote(symbol) {
+  const url = `https://www1.nseindia.com/live_market/dynaContent/live_watch/get_quote/ajaxGetQuoteJSON.jsp?series=EQ&symbol=${encodeURIComponent(symbol)}`;
+  return new Promise((resolve, reject) => {
+    https.get(url, {
+      agent: nseAgent,
+      headers: {
+        Referer: `https://www1.nseindia.com/live_market/dynaContent/live_watch/get_quote/GetQuote.jsp?symbol=${encodeURIComponent(symbol)}`,
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+      },
+    }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          resolve(json);
+        } catch (err) {
+          reject(new Error(`Invalid stock quote response: ${err.message || err}`));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+async function fetchMoneycontrolQuote(symbol) {
+  const url = `https://priceapi.moneycontrol.com/pricefeed/nse/equitycash/${encodeURIComponent(symbol)}`;
+  return new Promise((resolve, reject) => {
+    https.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        Accept: "application/json",
+      },
+    }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (!json?.data) {
+            return reject(new Error("Invalid Moneycontrol quote response"));
+          }
+          const data = json.data;
+          resolve({
+            symbol,
+            lastPrice: data.pricecurrent ? Number(data.pricecurrent) : data.HP ? Number(data.HP) : null,
+            openPrice: data.OPN ? Number(data.OPN) : null,
+            highPrice: data["52H"] ? Number(data["52H"]) : null,
+            lowPrice: data["52L"] ? Number(data["52L"]) : null,
+            prevClose: data.priceprevclose ? Number(data.priceprevclose) : null,
+            change: data.pricechange ? Number(data.pricechange) : null,
+            raw: data,
+          });
+        } catch (err) {
+          reject(new Error(`Invalid Moneycontrol quote response: ${err.message || err}`));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+async function fetchStockQuote(symbol) {
+  try {
+    return await fetchNseQuote(symbol);
+  } catch (error) {
+    return await fetchMoneycontrolQuote(symbol);
+  }
+}
 
 function buildBinary() {
   const result = spawnSync("make", [], { cwd: cppDir, stdio: "inherit" });
@@ -63,6 +139,20 @@ app.get("/api/price", (req, res) => {
     const iterations = Number(req.query.iterations ?? 100000);
     const result = runPricer({ spot, strike, rate, maturity, vol, type, iterations });
     res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || String(error) });
+  }
+});
+
+app.get("/api/stock", async (req, res) => {
+  const symbol = String(req.query.symbol ?? "").trim().toUpperCase();
+  if (!symbol) {
+    return res.status(400).json({ error: "symbol query parameter is required" });
+  }
+
+  try {
+    const quote = await fetchStockQuote(symbol);
+    res.json({ symbol, quote });
   } catch (error) {
     res.status(500).json({ error: error.message || String(error) });
   }

@@ -54,6 +54,11 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const [stockSymbol, setStockSymbol] = useState("");
+  const [stockQuote, setStockQuote] = useState<any>(null);
+  const [stockError, setStockError] = useState<string | null>(null);
+  const [stockLoading, setStockLoading] = useState(false);
+
   const data = useMemo(
     () => buildSeries(spot, strike, rate, vol, time, steps),
     [spot, strike, rate, vol, time, steps]
@@ -85,6 +90,28 @@ export default function App() {
       setElapsed(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function lookupStock() {
+    if (!stockSymbol.trim()) {
+      setStockError("Enter a stock symbol to search.");
+      return;
+    }
+    setStockLoading(true);
+    setStockError(null);
+    try {
+      const response = await fetch(`/api/stock?symbol=${encodeURIComponent(stockSymbol.trim().toUpperCase())}`);
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || "Stock lookup failed");
+      }
+      setStockQuote(result.quote);
+    } catch (err) {
+      setStockError(err instanceof Error ? err.message : String(err));
+      setStockQuote(null);
+    } finally {
+      setStockLoading(false);
     }
   }
 
@@ -170,6 +197,31 @@ export default function App() {
               max="10000000"
             />
           </label>
+          <div className="stock-search-box">
+            <h2>Live NSE Search</h2>
+            <label>
+              Stock symbol
+              <input
+                type="text"
+                value={stockSymbol}
+                onChange={(e) => setStockSymbol(e.target.value)}
+                placeholder="e.g. TCS"
+              />
+            </label>
+            <button className="run-button" onClick={lookupStock} disabled={stockLoading}>
+              {stockLoading ? "Searching..." : "Search Stock"}
+            </button>
+            {stockError ? <p className="error">{stockError}</p> : null}
+            {stockQuote ? (
+              <div className="quote-card">
+                <h3>{stockQuote.symbol || stockSymbol.toUpperCase()}</h3>
+                <p>Last Price: {stockQuote.lastPrice !== undefined && stockQuote.lastPrice !== null ? stockQuote.lastPrice : "N/A"}</p>
+                <p>Open Price: {stockQuote.openPrice !== undefined && stockQuote.openPrice !== null ? stockQuote.openPrice : "N/A"}</p>
+                <p>High Price: {stockQuote.highPrice !== undefined && stockQuote.highPrice !== null ? stockQuote.highPrice : "N/A"}</p>
+                <p>Low Price: {stockQuote.lowPrice !== undefined && stockQuote.lowPrice !== null ? stockQuote.lowPrice : "N/A"}</p>
+              </div>
+            ) : null}
+          </div>
         </section>
 
         <section className="panel results-panel">
