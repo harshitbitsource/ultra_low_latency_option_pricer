@@ -125,6 +125,11 @@ function runPricer(params) {
 
 app.use(express.json());
 
+const distDir = path.join(__dirname, "dist");
+if (fs.existsSync(distDir)) {
+  app.use(express.static(distDir));
+}
+
 app.get("/api/price", (req, res) => {
   try {
     if (!pathExists(binaryPath)) {
@@ -157,6 +162,12 @@ app.get("/api/stock", async (req, res) => {
     res.status(500).json({ error: error.message || String(error) });
   }
 });
+
+if (fs.existsSync(path.join(distDir, "index.html"))) {
+  app.get("*", (req, res) => {
+    res.sendFile(path.join(distDir, "index.html"));
+  });
+}
 
 function pathExists(pathToCheck) {
   try {
