@@ -18,9 +18,9 @@
 
     <main class="layout-grid">
       <section class="panel">
-        <h2>Live NSE Quote</h2>
+        <h2>Live Quote</h2>
         <label>Symbol
-          <input id="stock-symbol" type="text" placeholder="e.g. TCS" />
+          <input id="stock-symbol" type="text" placeholder="e.g. TCS or TCS.NS" />
         </label>
         <label>Market
           <select id="stock-market">
@@ -29,7 +29,9 @@
           </select>
         </label>
         <button id="stock-button">Fetch Quote</button>
-        <pre id="stock-result" class="result-box">Enter a symbol and click Fetch Quote.</pre>
+        <div id="stock-summary" class="quote-summary">Enter a symbol and click Fetch Quote.</div>
+        <canvas id="stock-chart" class="quote-chart" width="600" height="180"></canvas>
+        <pre id="stock-result" class="result-box">Quote details appear here.</pre>
       </section>
 
       <section class="panel">
@@ -61,25 +63,34 @@
       const stockButton = document.getElementById('stock-button');
       const priceButton = document.getElementById('price-button');
       const stockResult = document.getElementById('stock-result');
+      const stockSummary = document.getElementById('stock-summary');
+      const stockChart = document.getElementById('stock-chart');
       const priceResult = document.getElementById('price-result');
 
       stockButton.addEventListener('click', async () => {
         const symbol = document.getElementById('stock-symbol').value.trim().toUpperCase();
         const market = document.getElementById('stock-market').value;
+
         if (!symbol) {
+          stockSummary.textContent = '';
           stockResult.textContent = 'Enter a symbol first.';
+          drawQuoteChart([]);
           return;
         }
-        stockResult.textContent = 'Loading...';
+
+        stockSummary.textContent = 'Loading...';
+        stockResult.textContent = 'Fetching quote...';
+        drawQuoteChart([]);
 
         try {
           const response = await fetch(`/api/stock?symbol=${encodeURIComponent(symbol)}&market=${market}`);
           const data = await response.json();
           if (!response.ok) throw new Error(data.detail || data.error || 'Quote fetch failed');
-          const quote = data.quote;
-          stockResult.textContent = JSON.stringify(quote, null, 2);
+          renderQuote(data.quote);
         } catch (error) {
+          stockSummary.textContent = '';
           stockResult.textContent = error.message || String(error);
+          drawQuoteChart([]);
         }
       });
 
@@ -90,6 +101,7 @@
         const vol = document.getElementById('vol').value;
         const maturity = document.getElementById('maturity').value;
         const iterations = document.getElementById('iterations').value;
+
         priceResult.textContent = 'Running...';
 
         try {
@@ -110,6 +122,89 @@
           priceResult.textContent = error.message || String(error);
         }
       });
+
+      function formatNumber(value) {
+        return value == null || Number.isNaN(value) ? '—' : Number(value).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+      }
+
+      function renderQuote(quote) {
+        const changeText = quote.change != null ? `${formatNumber(quote.change)} (${quote.prevClose ? ((quote.change / quote.prevClose) * 100).toFixed(2) + '%' : '—'})` : '—';
+        stockSummary.innerHTML = `
+          <div class="quote-row"><span>Symbol</span><strong>${quote.symbol}</strong></div>
+          <div class="quote-row"><span>Price</span><strong>${formatNumber(quote.lastPrice)}</strong> ${quote.currency || ''}</div>
+          <div class="quote-row"><span>Change</span><strong>${changeText}</strong></div>
+          <div class="quote-row"><span>Open</span><strong>${formatNumber(quote.openPrice)}</strong></div>
+          <div class="quote-row"><span>High</span><strong>${formatNumber(quote.highPrice)}</strong></div>
+          <div class="quote-row"><span>Low</span><strong>${formatNumber(quote.lowPrice)}</strong></div>
+          <div class="quote-row"><span>Prev close</span><strong>${formatNumber(quote.prevClose)}</strong></div>
+        `;
+
+        drawQuoteChart(quote.series || []);
+        stockResult.textContent = JSON.stringify(quote.raw || quote, null, 2);
+      }
+
+      function drawQuoteChart(series) {
+        const ctx = stockChart.getContext('2d');
+        const width = stockChart.clientWidth;
+        const height = stockChart.height;
+        const dpr = window.devicePixelRatio || 1;
+        stockChart.width = width * dpr;
+        stockChart.height = height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+        ctx.fillRect(0, 0, width, height);
+
+        if (!series.length) {
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '14px Inter, system-ui, sans-serif';
+          ctx.fillText('No chart data available', 16, height / 2);
+          return;
+        }
+
+        const values = series.map(point => point.close).filter(v => v != null);
+        const minValue = Math.min(...values);
+        const maxValue = Math.max(...values);
+        const valueRange = Math.max(maxValue - minValue, 1);
+        const padding = 16;
+        const innerWidth = width - padding * 2;
+        const innerHeight = height - padding * 2;
+        const stepX = innerWidth / Math.max(values.length - 1, 1);
+
+        ctx.strokeStyle = '#8b5cf6';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        values.forEach((value, index) => {
+          const x = padding + index * stepX;
+          const y = padding + innerHeight - ((value - minValue) / valueRange) * innerHeight;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+        ctx.beginPath();
+        values.forEach((value, index) => {
+          const x = padding + index * stepX;
+          const y = padding + innerHeight - ((value - minValue) / valueRange) * innerHeight;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.lineTo(padding + (values.length - 1) * stepX, padding + innerHeight);
+        ctx.lineTo(padding, padding + innerHeight);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i <= 3; i += 1) {
+          const y = padding + (innerHeight / 3) * i;
+          ctx.moveTo(padding, y);
+          ctx.lineTo(width - padding, y);
+        }
+        ctx.stroke();
+      }
     </script>
   </div>
 </body>

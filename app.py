@@ -1,4 +1,9 @@
+import json
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +21,109 @@ app = FastAPI(
     description="Lightweight backend using NSEPython for NSE equity quotes and ccxt for crypto quotes.",
     version="1.0",
 )
+
+YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search?q={query}&lang=en-IN"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=5m"
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def load_json_url(url: str) -> dict:
+    request = Request(url, headers=YAHOO_HEADERS)
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(f"Yahoo API failed: {exc.code} {exc.reason}")
+    except URLError as exc:
+        raise ValueError(f"Yahoo API failed: {exc.reason}")
+
+
+def build_yahoo_symbol(symbol: str) -> str:
+    symbol_value = symbol.strip().upper()
+    if symbol_value.endswith(".NS"):
+        return symbol_value
+    if "." in symbol_value:
+        return symbol_value
+    return f"{symbol_value}.NS"
+
+
+def choose_yahoo_nse_symbol(payload: dict, query: str) -> str:
+    quotes = payload.get("quotes", []) or []
+    for item in quotes:
+        if item.get("exchange") in {"NSI", "NSE"} and item.get("quoteType") == "EQUITY":
+            symbol = item.get("symbol")
+            if symbol and symbol.endswith(".NS"):
+                return symbol
+    for item in quotes:
+        symbol = item.get("symbol")
+        if symbol and symbol.endswith(".NS"):
+            return symbol
+    if query and query.upper().endswith(".NS"):
+        return query.upper()
+    raise ValueError("Could not map symbol to a Yahoo NSE equity symbol; symbol may be delisted or unavailable")
+
+
+def search_yahoo_equity_symbol(query: str) -> str:
+    payload = load_json_url(YAHOO_SEARCH_URL.format(query=quote_plus(query)))
+    return choose_yahoo_nse_symbol(payload, query)
+
+
+def parse_yahoo_chart_payload(payload: dict, symbol: str) -> dict:
+    chart = payload.get("chart", {})
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError("Yahoo chart returned no result")
+
+    result = results[0]
+    meta = result.get("meta", {})
+    indicators = result.get("indicators", {})
+    quote_data = (indicators.get("quote") or [{}])[0]
+    timestamps = result.get("timestamp") or []
+    closes = quote_data.get("close") or []
+    opens = quote_data.get("open") or []
+    highs = quote_data.get("high") or []
+    lows = quote_data.get("low") or []
+
+    last_price = safe_float(meta.get("regularMarketPrice"))
+    if last_price is None:
+        last_price = next((safe_float(x) for x in reversed(closes) if x is not None), None)
+
+    open_price = safe_float(meta.get("open")) or next((safe_float(x) for x in opens if x is not None), None)
+    high_price = safe_float(max((x for x in highs if x is not None), default=None))
+    low_price = safe_float(min((x for x in lows if x is not None), default=None))
+    prev_close = safe_float(meta.get("previousClose") or meta.get("chartPreviousClose"))
+    change = safe_float(last_price - prev_close) if last_price is not None and prev_close is not None else None
+
+    series = []
+    for ts, close in zip(timestamps, closes):
+        if close is not None:
+            series.append({"ts": int(ts), "close": safe_float(close)})
+
+    return {
+        "symbol": symbol,
+        "lastPrice": last_price,
+        "openPrice": open_price,
+        "highPrice": high_price,
+        "lowPrice": low_price,
+        "prevClose": prev_close,
+        "change": change,
+        "currency": meta.get("currency"),
+        "series": series,
+        "raw": payload,
+    }
+
+
+def fetch_yahoo_equity_quote(symbol: str) -> dict:
+    symbol_value = symbol.strip().upper()
+    if not symbol_value.endswith(".NS"):
+        symbol_value = search_yahoo_equity_symbol(symbol_value)
+
+    payload = load_json_url(YAHOO_CHART_URL.format(symbol=symbol_value))
+    return parse_yahoo_chart_payload(payload, symbol_value)
 
 
 def build_pricer() -> None:
@@ -150,9 +258,13 @@ def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
 def fetch_nse_stock_quote(symbol: str) -> dict:
     symbol_value = nsesymbolpurify(symbol.strip().upper())
     payload = nse_eq(symbol_value)
-    if not payload or not isinstance(payload, dict):
-        raise ValueError("NSEPython returned no quote data")
-    return parse_stock_quote_payload(payload, symbol_value)
+    if payload and isinstance(payload, dict):
+        try:
+            return parse_stock_quote_payload(payload, symbol_value)
+        except ValueError:
+            pass
+
+    return fetch_yahoo_equity_quote(symbol_value)
 
 
 def fetch_crypto_quote(symbol: str) -> dict:
