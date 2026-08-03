@@ -1,12 +1,116 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Ultra Low Latency Option Pricer</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ultra Low Latency Option Pricer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Ultra Low Latency Option Pricer</p>
+        <h1>Minimal NSE stock + crypto quote engine</h1>
+        <p>Uses NSEPython for NSE equity quotes and ccxt for crypto prices. Pricing runs the local C++ Black-Scholes engine.</p>
+      </div>
+    </header>
+
+    <main class="layout-grid">
+      <section class="panel">
+        <h2>Live NSE Quote</h2>
+        <label>Symbol
+          <input id="stock-symbol" type="text" placeholder="e.g. TCS" />
+        </label>
+        <label>Market
+          <select id="stock-market">
+            <option value="equity">Equity</option>
+            <option value="crypto">Crypto</option>
+          </select>
+        </label>
+        <button id="stock-button">Fetch Quote</button>
+        <pre id="stock-result" class="result-box">Enter a symbol and click Fetch Quote.</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Option Pricing</h2>
+        <label>Spot Price
+          <input id="spot" type="number" value="100" min="1" step="1" />
+        </label>
+        <label>Strike Price
+          <input id="strike" type="number" value="100" min="1" step="1" />
+        </label>
+        <label>Interest Rate
+          <input id="rate" type="number" value="0.05" min="0" max="1" step="0.01" />
+        </label>
+        <label>Volatility
+          <input id="vol" type="number" value="0.25" min="0.01" max="2" step="0.01" />
+        </label>
+        <label>Time to Expiry (years)
+          <input id="maturity" type="number" value="1" min="0.1" max="5" step="0.1" />
+        </label>
+        <label>Iterations
+          <input id="iterations" type="number" value="100000" min="1000" step="1000" />
+        </label>
+        <button id="price-button">Run Pricing</button>
+        <pre id="price-result" class="result-box">Run pricing to see the computed option result.</pre>
+      </section>
+    </main>
+
+    <script>
+      const stockButton = document.getElementById('stock-button');
+      const priceButton = document.getElementById('price-button');
+      const stockResult = document.getElementById('stock-result');
+      const priceResult = document.getElementById('price-result');
+
+      stockButton.addEventListener('click', async () => {
+        const symbol = document.getElementById('stock-symbol').value.trim().toUpperCase();
+        const market = document.getElementById('stock-market').value;
+        if (!symbol) {
+          stockResult.textContent = 'Enter a symbol first.';
+          return;
+        }
+        stockResult.textContent = 'Loading...';
+
+        try {
+          const response = await fetch(`/api/stock?symbol=${encodeURIComponent(symbol)}&market=${market}`);
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || data.error || 'Quote fetch failed');
+          const quote = data.quote;
+          stockResult.textContent = JSON.stringify(quote, null, 2);
+        } catch (error) {
+          stockResult.textContent = error.message || String(error);
+        }
+      });
+
+      priceButton.addEventListener('click', async () => {
+        const spot = document.getElementById('spot').value;
+        const strike = document.getElementById('strike').value;
+        const rate = document.getElementById('rate').value;
+        const vol = document.getElementById('vol').value;
+        const maturity = document.getElementById('maturity').value;
+        const iterations = document.getElementById('iterations').value;
+        priceResult.textContent = 'Running...';
+
+        try {
+          const params = new URLSearchParams({
+            spot,
+            strike,
+            rate,
+            maturity,
+            vol,
+            type: 'call',
+            iterations,
+          });
+          const response = await fetch(`/api/price?${params}`);
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || 'Pricing failed');
+          priceResult.textContent = JSON.stringify(data, null, 2);
+        } catch (error) {
+          priceResult.textContent = error.message || String(error);
+        }
+      });
+    </script>
+  </div>
+</body>
 </html>
