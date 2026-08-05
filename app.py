@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
+from functools import lru_cache
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
@@ -9,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import ccxt
 import subprocess
-from nsepython import nse_eq, nsesymbolpurify
+from nsepython import nse_eq, nse_eq_symbols, nse_quote, nsesymbolpurify
 
 ROOT = Path(__file__).resolve().parent
 CPP_DIR = ROOT / "cpp"
@@ -191,6 +192,24 @@ def safe_float(value, default=None):
         return default
 
 
+@lru_cache(maxsize=1)
+def get_nse_symbol_list() -> list[str]:
+    try:
+        payload = nse_eq_symbols()
+        return sorted(payload) if isinstance(payload, list) else []
+    except Exception:
+        return []
+
+
+@app.get("/api/nse-symbols")
+def api_nse_symbols(q: str = Query("", alias="q")) -> dict:
+    symbols = get_nse_symbol_list()
+    if q:
+        query = q.strip().upper()
+        symbols = [symbol for symbol in symbols if query in symbol]
+    return {"symbols": symbols[:300], "total": len(symbols)}
+
+
 def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("Invalid quote payload")
@@ -257,14 +276,25 @@ def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
 
 def fetch_nse_stock_quote(symbol: str) -> dict:
     symbol_value = nsesymbolpurify(symbol.strip().upper())
-    payload = nse_eq(symbol_value)
-    if payload and isinstance(payload, dict):
+    errors = []
+    for fetch_fn in (nse_quote, nse_eq):
         try:
-            return parse_stock_quote_payload(payload, symbol_value)
-        except ValueError:
-            pass
+            payload = fetch_fn(symbol_value)
+            if payload and isinstance(payload, dict):
+                try:
+                    return parse_stock_quote_payload(payload, symbol_value)
+                except ValueError as exc:
+                    errors.append(exc)
+        except Exception as exc:
+            errors.append(exc)
 
-    return fetch_yahoo_equity_quote(symbol_value)
+    try:
+        return fetch_yahoo_equity_quote(symbol_value)
+    except Exception as exc:
+        errors.append(exc)
+        raise ValueError(
+            f"Could not fetch NSE quote for {symbol_value}; errors: {errors}"
+        )
 
 
 def fetch_crypto_quote(symbol: str) -> dict:

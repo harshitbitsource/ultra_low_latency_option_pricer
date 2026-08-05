@@ -20,7 +20,8 @@
       <section class="panel">
         <h2>Live Quote</h2>
         <label>Symbol
-          <input id="stock-symbol" type="text" placeholder="e.g. TCS or TCS.NS" />
+          <input id="stock-symbol" type="text" list="nse-symbols" placeholder="e.g. TCS or TCS.NS" />
+          <datalist id="nse-symbols"></datalist>
         </label>
         <label>Market
           <select id="stock-market">
@@ -66,6 +67,26 @@
       const stockSummary = document.getElementById('stock-summary');
       const stockChart = document.getElementById('stock-chart');
       const priceResult = document.getElementById('price-result');
+      const symbolList = document.getElementById('nse-symbols');
+
+      async function loadSymbols(query = '') {
+        try {
+          const response = await fetch(`/api/nse-symbols?q=${encodeURIComponent(query)}`);
+          const data = await response.json();
+          symbolList.innerHTML = data.symbols.map(symbol => `<option value="${symbol}"></option>`).join('');
+        } catch (error) {
+          console.warn('Failed to load NSE symbol list', error);
+        }
+      }
+
+      loadSymbols();
+
+      document.getElementById('stock-symbol').addEventListener('input', (event) => {
+        const query = event.target.value.trim();
+        if (query.length >= 2) {
+          loadSymbols(query);
+        }
+      });
 
       stockButton.addEventListener('click', async () => {
         const symbol = document.getElementById('stock-symbol').value.trim().toUpperCase();
@@ -144,7 +165,7 @@
         }
 
         drawQuoteChart(quote.series || []);
-        stockResult.textContent = JSON.stringify(quote.raw || quote, null, 2);
+        stockResult.textContent = 'Quote loaded successfully.';
       }
 
       function drawQuoteChart(series) {
