@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
@@ -201,13 +202,126 @@ def get_nse_symbol_list() -> list[str]:
         return []
 
 
+@lru_cache(maxsize=1)
+def get_crypto_symbol_list() -> list[str]:
+    try:
+        exchange = ccxt.binance({"enableRateLimit": True})
+        markets = exchange.load_markets()
+        symbols = sorted([symbol for symbol in markets.keys() if symbol.endswith("/USDT")])
+        return symbols
+    except Exception:
+        return []
+
+
 @app.get("/api/nse-symbols")
 def api_nse_symbols(q: str = Query("", alias="q")) -> dict:
     symbols = get_nse_symbol_list()
     if q:
         query = q.strip().upper()
         symbols = [symbol for symbol in symbols if query in symbol]
-    return {"symbols": symbols[:300], "total": len(symbols)}
+    return {"symbols": symbols[:800], "total": len(symbols)}
+
+
+@app.get("/api/crypto-symbols")
+def api_crypto_symbols(q: str = Query("", alias="q")) -> dict:
+    symbols = get_crypto_symbol_list()
+    if q:
+        query = q.strip().upper()
+        symbols = [symbol for symbol in symbols if query in symbol]
+    return {"symbols": symbols[:200], "total": len(symbols)}
+
+
+def black_scholes_price_and_greeks(
+    spot: float,
+    strike: float,
+    rate: float,
+    maturity: float,
+    vol: float,
+    option_type: str,
+) -> dict:
+    if spot <= 0 or strike <= 0 or vol <= 0 or maturity <= 0:
+        raise ValueError("Invalid inputs for Black-Scholes calculation")
+
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * maturity) / (vol * math.sqrt(maturity))
+    d2 = d1 - vol * math.sqrt(maturity)
+    nd1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    nd2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+    npd1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
+
+    if option_type == "call":
+        price = spot * nd1 - strike * math.exp(-rate * maturity) * nd2
+        delta = nd1
+        theta = -((spot * npd1 * vol) / (2 * math.sqrt(maturity))) - rate * strike * math.exp(-rate * maturity) * nd2
+        rho = strike * maturity * math.exp(-rate * maturity) * nd2
+    else:
+        price = strike * math.exp(-rate * maturity) * (1 - nd2) - spot * (1 - nd1)
+        delta = nd1 - 1
+        theta = -((spot * npd1 * vol) / (2 * math.sqrt(maturity))) + rate * strike * math.exp(-rate * maturity) * (1 - nd2)
+        rho = -strike * maturity * math.exp(-rate * maturity) * (1 - nd2)
+
+    gamma = npd1 / (spot * vol * math.sqrt(maturity))
+    vega = spot * npd1 * math.sqrt(maturity)
+
+    return {
+        "price": price,
+        "delta": delta,
+        "gamma": gamma,
+        "vega": vega,
+        "theta": theta,
+        "rho": rho,
+    }
+
+
+def simulate_option_curve(
+    spot: float,
+    strike: float,
+    rate: float,
+    maturity: float,
+    vol: float,
+    option_type: str,
+    steps: int = 41,
+) -> dict:
+    center = spot
+    low = max(1.0, spot * 0.5)
+    high = spot * 1.5
+    step = max(1.0, (high - low) / max(steps - 1, 1))
+    series = []
+    for i in range(steps):
+        s = low + step * i
+        metrics = black_scholes_price_and_greeks(s, strike, rate, maturity, vol, option_type)
+        series.append({"spot": round(s, 2), "optionPrice": round(metrics["price"], 4)})
+    return {"series": series}
+
+
+@app.get("/api/greeks")
+def api_greeks(
+    spot: float = Query(100.0, gt=0.0),
+    strike: float = Query(100.0, gt=0.0),
+    rate: float = Query(0.05, ge=0.0),
+    maturity: float = Query(1.0, gt=0.0),
+    vol: float = Query(0.2, gt=0.0),
+    option_type: str = Query("call", regex="^(call|put)$", alias="type"),
+) -> dict:
+    try:
+        return black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/simulate")
+def api_simulate(
+    spot: float = Query(100.0, gt=0.0),
+    strike: float = Query(100.0, gt=0.0),
+    rate: float = Query(0.05, ge=0.0),
+    maturity: float = Query(1.0, gt=0.0),
+    vol: float = Query(0.2, gt=0.0),
+    option_type: str = Query("call", regex="^(call|put)$", alias="type"),
+    steps: int = Query(41, ge=5, le=201),
+) -> dict:
+    try:
+        return simulate_option_curve(spot, strike, rate, maturity, vol, option_type, steps)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:

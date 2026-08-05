@@ -12,7 +12,11 @@
       <div>
         <p class="eyebrow">Ultra Low Latency Option Pricer</p>
         <h1>Minimal NSE stock + crypto quote engine</h1>
-        <p>Uses NSEPython for NSE equity quotes and ccxt for crypto prices. Pricing runs the local C++ Black-Scholes engine.</p>
+        <p>Real-time quotes, NSE symbol search, crypto lookup, pricing greeks, and simulation charts. Built for low-latency option workflows.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refresh-symbols">Refresh NSE symbols</button>
+        <button id="refresh-crypto">Load crypto markets</button>
       </div>
     </header>
 
@@ -55,7 +59,15 @@
         <label>Iterations
           <input id="iterations" type="number" value="100000" min="1000" step="1000" />
         </label>
+        <label>Option Type
+          <select id="option-type">
+            <option value="call">Call</option>
+            <option value="put">Put</option>
+          </select>
+        </label>
         <button id="price-button">Run Pricing</button>
+        <div id="greek-grid" class="greek-grid"></div>
+        <canvas id="price-chart" class="quote-chart" width="600" height="180"></canvas>
         <pre id="price-result" class="result-box">Run pricing to see the computed option result.</pre>
       </section>
     </main>
@@ -68,29 +80,100 @@
       const stockChart = document.getElementById('stock-chart');
       const priceResult = document.getElementById('price-result');
       const symbolList = document.getElementById('nse-symbols');
+      const marketSelect = document.getElementById('stock-market');
+      const optionTypeSelect = document.getElementById('option-type');
+      const greekGrid = document.getElementById('greek-grid');
+      const priceChart = document.getElementById('price-chart');
+      const refreshSymbolsButton = document.getElementById('refresh-symbols');
+      const refreshCryptoButton = document.getElementById('refresh-crypto');
+      const symbolStatus = document.createElement('div');
+      symbolStatus.className = 'symbol-status';
+      document.querySelector('.panel').appendChild(symbolStatus);
 
-      async function loadSymbols(query = '') {
+      let autoRefreshHandle = null;
+      let lastQuoteSymbol = '';
+      let lastQuoteMarket = '';
+
+      async function loadSymbols(query = '', market = 'equity') {
+        const endpoint = market === 'crypto' ? '/api/crypto-symbols' : '/api/nse-symbols';
+        const symbolName = market === 'crypto' ? 'crypto' : 'NSE';
         try {
-          const response = await fetch(`/api/nse-symbols?q=${encodeURIComponent(query)}`);
+          const response = await fetch(`${endpoint}?q=${encodeURIComponent(query)}`);
           const data = await response.json();
           symbolList.innerHTML = data.symbols.map(symbol => `<option value="${symbol}"></option>`).join('');
+          symbolStatus.textContent = `${data.total} ${symbolName} symbols available`;
         } catch (error) {
-          console.warn('Failed to load NSE symbol list', error);
+          console.warn(`Failed to load ${symbolName} symbols`, error);
+          symbolStatus.textContent = `Failed to load ${symbolName} symbols`;
+        }
+      }
+
+      function updateSymbolPlaceholder() {
+        const market = marketSelect.value;
+        const input = document.getElementById('stock-symbol');
+        input.placeholder = market === 'crypto' ? 'e.g. BTC/USDT or ETH/USDT' : 'e.g. TCS or TCS.NS';
+      }
+
+      async function refreshQuoteList() {
+        const market = marketSelect.value;
+        const query = document.getElementById('stock-symbol').value.trim();
+        await loadSymbols(query.length >= 2 ? query : '', market);
+      }
+
+      async function fetchQuote(symbol, market) {
+        if (!symbol) return;
+        try {
+          const response = await fetch(`/api/stock?symbol=${encodeURIComponent(symbol)}&market=${market}`);
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || data.error || 'Quote fetch failed');
+          renderQuote(data.quote, market);
+          lastQuoteSymbol = symbol;
+          lastQuoteMarket = market;
+          startAutoRefresh();
+        } catch (error) {
+          stockSummary.textContent = '';
+          stockResult.textContent = error.message || String(error);
+          drawQuoteChart([]);
+          stopAutoRefresh();
+        }
+      }
+
+      function startAutoRefresh() {
+        stopAutoRefresh();
+        if (!lastQuoteSymbol) return;
+        autoRefreshHandle = window.setInterval(() => {
+          fetchQuote(lastQuoteSymbol, lastQuoteMarket);
+        }, 20000);
+      }
+
+      function stopAutoRefresh() {
+        if (autoRefreshHandle !== null) {
+          clearInterval(autoRefreshHandle);
+          autoRefreshHandle = null;
         }
       }
 
       loadSymbols();
+      updateSymbolPlaceholder();
 
       document.getElementById('stock-symbol').addEventListener('input', (event) => {
         const query = event.target.value.trim();
         if (query.length >= 2) {
-          loadSymbols(query);
+          refreshQuoteList();
         }
       });
 
+      marketSelect.addEventListener('change', () => {
+        updateSymbolPlaceholder();
+        refreshQuoteList();
+      });
+
+      refreshSymbolsButton.addEventListener('click', () => loadSymbols('', 'equity'));
+      refreshCryptoButton.addEventListener('click', () => loadSymbols('', 'crypto'));
+
       stockButton.addEventListener('click', async () => {
         const symbol = document.getElementById('stock-symbol').value.trim().toUpperCase();
-        const market = document.getElementById('stock-market').value;
+        const market = marketSelect.value;
 
         if (!symbol) {
           stockSummary.textContent = '';
@@ -103,16 +186,7 @@
         stockResult.textContent = 'Fetching quote...';
         drawQuoteChart([]);
 
-        try {
-          const response = await fetch(`/api/stock?symbol=${encodeURIComponent(symbol)}&market=${market}`);
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.detail || data.error || 'Quote fetch failed');
-          renderQuote(data.quote);
-        } catch (error) {
-          stockSummary.textContent = '';
-          stockResult.textContent = error.message || String(error);
-          drawQuoteChart([]);
-        }
+        await fetchQuote(symbol, market);
       });
 
       priceButton.addEventListener('click', async () => {
@@ -122,23 +196,29 @@
         const vol = document.getElementById('vol').value;
         const maturity = document.getElementById('maturity').value;
         const iterations = document.getElementById('iterations').value;
+        const type = optionTypeSelect.value;
 
-        priceResult.textContent = 'Running...';
+        priceResult.textContent = 'Running pricing and simulations...';
+        greekGrid.innerHTML = '';
+        drawPriceChart([]);
 
         try {
-          const params = new URLSearchParams({
-            spot,
-            strike,
-            rate,
-            maturity,
-            vol,
-            type: 'call',
-            iterations,
-          });
-          const response = await fetch(`/api/price?${params}`);
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.detail || 'Pricing failed');
-          priceResult.textContent = JSON.stringify(data, null, 2);
+          const params = new URLSearchParams({ spot, strike, rate, maturity, vol, type, iterations });
+          const [priceResp, greeksResp, simResp] = await Promise.all([
+            fetch(`/api/price?${params}`),
+            fetch(`/api/greeks?${params}`),
+            fetch(`/api/simulate?${params}&steps=41`),
+          ]);
+
+          const priceData = await priceResp.json();
+          const greeksData = await greeksResp.json();
+          const simData = await simResp.json();
+
+          if (!priceResp.ok) throw new Error(priceData.detail || priceData.error || 'Pricing failed');
+          if (!greeksResp.ok) throw new Error(greeksData.detail || greeksData.error || 'Greeks failed');
+          if (!simResp.ok) throw new Error(simData.detail || simData.error || 'Simulation failed');
+
+          renderPricing(priceData, greeksData, simData.series || []);
         } catch (error) {
           priceResult.textContent = error.message || String(error);
         }
@@ -148,11 +228,18 @@
         return value == null || Number.isNaN(value) ? '—' : Number(value).toLocaleString('en-IN', { maximumFractionDigits: 2 });
       }
 
-      function renderQuote(quote) {
+      function formatPercent(value) {
+        return value == null || Number.isNaN(value) ? '—' : `${(Number(value) * 100).toFixed(2)}%`;
+      }
+
+      function renderQuote(quote, market) {
         const changeText = quote.change != null ? `${formatNumber(quote.change)} (${quote.prevClose ? ((quote.change / quote.prevClose) * 100).toFixed(2) + '%' : '—'})` : '—';
+        const currency = market === 'crypto' ? 'USDT' : quote.currency || '';
+
         stockSummary.innerHTML = `
           <div class="quote-row"><span>Symbol</span><strong>${quote.symbol}</strong></div>
-          <div class="quote-row"><span>Price</span><strong>${formatNumber(quote.lastPrice)}</strong> ${quote.currency || ''}</div>
+          <div class="quote-row"><span>Market</span><strong>${market.toUpperCase()}</strong></div>
+          <div class="quote-row"><span>Price</span><strong>${formatNumber(quote.lastPrice)}</strong> ${currency}</div>
           <div class="quote-row"><span>Change</span><strong>${changeText}</strong></div>
           <div class="quote-row"><span>Open</span><strong>${formatNumber(quote.openPrice)}</strong></div>
           <div class="quote-row"><span>High</span><strong>${formatNumber(quote.highPrice)}</strong></div>
@@ -166,6 +253,29 @@
 
         drawQuoteChart(quote.series || []);
         stockResult.textContent = 'Quote loaded successfully.';
+      }
+
+      function renderPricing(priceData, greeksData, series) {
+        priceResult.innerHTML = `
+          <div class="result-summary">
+            <strong>Option price</strong>
+            <span>${formatNumber(priceData.price)}</span>
+          </div>
+          <div class="result-summary">
+            <strong>Engine iterations</strong>
+            <span>${priceData.benchmark_iterations ?? '—'}</span>
+          </div>
+          <div class="result-summary">
+            <strong>Latency</strong>
+            <span>${formatNumber(priceData.elapsed_ms)} ms</span>
+          </div>
+        `;
+
+        greekGrid.innerHTML = Object.entries(greeksData)
+          .map(([name, value]) => `<div class="greek-metric"><small>${name}</small><strong>${name === 'theta' || name === 'rho' ? formatNumber(value) : formatNumber(value)}</strong></div>`)
+          .join('');
+
+        drawPriceChart(series);
       }
 
       function drawQuoteChart(series) {
@@ -207,7 +317,7 @@
         });
         ctx.stroke();
 
-        ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+        ctx.fillStyle = 'rgba(99, 102, 241, 0.12)';
         ctx.beginPath();
         values.forEach((value, index) => {
           const x = padding + index * stepX;
@@ -216,6 +326,69 @@
           else ctx.lineTo(x, y);
         });
         ctx.lineTo(padding + (values.length - 1) * stepX, padding + innerHeight);
+        ctx.lineTo(padding, padding + innerHeight);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = '#475569';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i <= 3; i += 1) {
+          const y = padding + (innerHeight / 3) * i;
+          ctx.moveTo(padding, y);
+          ctx.lineTo(width - padding, y);
+        }
+        ctx.stroke();
+      }
+
+      function drawPriceChart(series) {
+        const ctx = priceChart.getContext('2d');
+        const width = priceChart.clientWidth;
+        const height = priceChart.height;
+        const dpr = window.devicePixelRatio || 1;
+        priceChart.width = width * dpr;
+        priceChart.height = height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+        ctx.fillRect(0, 0, width, height);
+
+        if (!series.length) {
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '14px Inter, system-ui, sans-serif';
+          ctx.fillText('No payoff simulation available', 16, height / 2);
+          return;
+        }
+
+        const values = series.map(point => point.optionPrice);
+        const minValue = Math.min(...values);
+        const maxValue = Math.max(...values);
+        const valueRange = Math.max(maxValue - minValue, 1);
+        const padding = 16;
+        const innerWidth = width - padding * 2;
+        const innerHeight = height - padding * 2;
+        const stepX = innerWidth / Math.max(series.length - 1, 1);
+
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        series.forEach((point, index) => {
+          const x = padding + index * stepX;
+          const y = padding + innerHeight - ((point.optionPrice - minValue) / valueRange) * innerHeight;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
+        ctx.beginPath();
+        series.forEach((point, index) => {
+          const x = padding + index * stepX;
+          const y = padding + innerHeight - ((point.optionPrice - minValue) / valueRange) * innerHeight;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.lineTo(padding + (series.length - 1) * stepX, padding + innerHeight);
         ctx.lineTo(padding, padding + innerHeight);
         ctx.closePath();
         ctx.fill();
