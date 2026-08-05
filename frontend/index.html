@@ -139,6 +139,10 @@
           <div class="quote-row"><span>Prev close</span><strong>${formatNumber(quote.prevClose)}</strong></div>
         `;
 
+        if (quote.lastPrice != null) {
+          document.getElementById('spot').value = quote.lastPrice;
+        }
+
         drawQuoteChart(quote.series || []);
         stockResult.textContent = JSON.stringify(quote.raw || quote, null, 2);
       }
