@@ -1,6 +1,8 @@
 import json
 import math
+import random
 import statistics
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
@@ -43,6 +45,11 @@ class DashboardRequest(BaseModel):
     vol: float = 0.2
     option_type: str = "call"
     series: list[dict] | None = None
+
+
+class AnalyticsRequest(DashboardRequest):
+    model: str = "black_scholes"
+    strategy: str = "long_call"
 
 
 def load_json_url(url: str) -> dict:
@@ -395,6 +402,51 @@ def binomial_tree_price(
     return round(prices[0], 4)
 
 
+def monte_carlo_price(spot: float, strike: float, rate: float, maturity: float, vol: float,
+                      option_type: str, paths: int = 8000) -> float:
+    """Antithetic Monte Carlo estimate; deterministic seed keeps the dashboard stable."""
+    rng = random.Random(42)
+    drift = (rate - 0.5 * vol * vol) * maturity
+    spread = vol * math.sqrt(maturity)
+    total = 0.0
+    for _ in range(max(paths // 2, 1)):
+        z = rng.gauss(0.0, 1.0)
+        for shock in (z, -z):
+            terminal = spot * math.exp(drift + spread * shock)
+            total += max(terminal - strike, 0.0) if option_type == "call" else max(strike - terminal, 0.0)
+    return round(math.exp(-rate * maturity) * total / (2 * max(paths // 2, 1)), 4)
+
+
+def build_sensitivity_surface(spot: float, strike: float, rate: float, maturity: float,
+                              vol: float, option_type: str) -> list[dict]:
+    """Compact strike × DTE Greek grid suitable for a heat-map or a mobile table."""
+    rows = []
+    for dte in (7, 30, 90, 180):
+        for multiplier in (0.85, 0.925, 1.0, 1.075, 1.15):
+            row_strike = round(strike * multiplier, 2)
+            values = black_scholes_price_and_greeks(spot, row_strike, rate, dte / 365, vol, option_type)
+            rows.append({"strike": row_strike, "dte": dte, **{key: round(value, 5) for key, value in values.items()}})
+    return rows
+
+
+def build_strategy_payoff(spot: float, strike: float, premium: float, strategy: str) -> list[dict]:
+    points = []
+    for index in range(31):
+        terminal = spot * (0.6 + index * 0.8 / 30)
+        call = max(terminal - strike, 0.0)
+        put = max(strike - terminal, 0.0)
+        if strategy == "long_put":
+            pnl = put - premium
+        elif strategy == "straddle":
+            pnl = call + put - 2 * premium
+        elif strategy == "collar":
+            pnl = min(max(terminal - spot, -premium), premium)
+        else:
+            pnl = call - premium
+        points.append({"spot": round(terminal, 2), "pnl": round(pnl, 3)})
+    return points
+
+
 def solve_implied_volatility(
     market_price: float,
     spot: float,
@@ -428,11 +480,20 @@ def build_dashboard_payload(
     market_price = bs["price"] * (1 + 0.04 * (1 - min(abs(spot - strike) / max(spot, 1.0), 0.8)))
     market_iv = solve_implied_volatility(market_price, spot, strike, rate, maturity, option_type)
     volatility = build_volatility_summary(series, vol)
+    model_start = time.perf_counter()
+    mc = monte_carlo_price(spot, strike, rate, maturity, vol, option_type)
+    analytics_ms = round((time.perf_counter() - model_start) * 1000, 3)
     return {
         "modelPrice": round(bs["price"], 4),
         "marketPrice": round(market_price, 4),
         "binomialPrice": binomial,
         "priceDifference": round(market_price - bs["price"], 4),
+        "models": {
+            "blackScholes": round(bs["price"], 4),
+            "binomialAmerican": binomial,
+            "monteCarloAntithetic": mc,
+        },
+        "latency": {"analyticsMs": analytics_ms, "note": "Browser/network time is excluded."},
         "greeks": bs,
         "volatility": volatility,
         "impliedVol": {
@@ -441,7 +502,7 @@ def build_dashboard_payload(
             "gap": round(market_iv - vol, 4),
             "signal": "rich" if market_iv > vol else "cheap",
         },
-        "note": "Compact dashboard: BS benchmark, binomial sanity check, and realized-vs-implied regime signal.",
+        "note": "Market price/IV is an estimate unless a live option-chain provider is connected; it is not an NSE quote.",
     }
 
 
@@ -615,6 +676,27 @@ def api_dashboard(payload: DashboardRequest) -> dict:
             payload.option_type,
             payload.series,
         )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/analytics")
+def api_analytics(payload: AnalyticsRequest) -> dict:
+    """One request powering the model comparison, Greeks surface and strategy payoff."""
+    try:
+        started = time.perf_counter()
+        dashboard = build_dashboard_payload(payload.spot, payload.strike, payload.rate, payload.maturity,
+                                            payload.vol, payload.option_type, payload.series)
+        greeks = black_scholes_price_and_greeks(payload.spot, payload.strike, payload.rate,
+                                                payload.maturity, payload.vol, payload.option_type)
+        return {
+            **dashboard,
+            "surface": build_sensitivity_surface(payload.spot, payload.strike, payload.rate, payload.maturity,
+                                                 payload.vol, payload.option_type),
+            "payoff": build_strategy_payoff(payload.spot, payload.strike, greeks["price"], payload.strategy),
+            "strategy": payload.strategy,
+            "requestMs": round((time.perf_counter() - started) * 1000, 3),
+        }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
