@@ -40,6 +40,13 @@
       </section>
 
       <section class="panel">
+        <h2>Market Dashboard</h2>
+        <button id="dashboard-button">Run Dashboard</button>
+        <div id="dashboard-summary" class="quote-summary">Select inputs and run the compact dashboard.</div>
+        <div id="dashboard-grid" class="greek-grid"></div>
+      </section>
+
+      <section class="panel">
         <h2>Option Pricing</h2>
         <label>Spot Price
           <input id="spot" type="number" value="100" min="1" step="1" />
@@ -75,6 +82,7 @@
     <script>
       const stockButton = document.getElementById('stock-button');
       const priceButton = document.getElementById('price-button');
+      const dashboardButton = document.getElementById('dashboard-button');
       const stockResult = document.getElementById('stock-result');
       const stockSummary = document.getElementById('stock-summary');
       const stockChart = document.getElementById('stock-chart');
@@ -83,6 +91,8 @@
       const marketSelect = document.getElementById('stock-market');
       const optionTypeSelect = document.getElementById('option-type');
       const greekGrid = document.getElementById('greek-grid');
+      const dashboardSummary = document.getElementById('dashboard-summary');
+      const dashboardGrid = document.getElementById('dashboard-grid');
       const priceChart = document.getElementById('price-chart');
       const refreshSymbolsButton = document.getElementById('refresh-symbols');
       const refreshCryptoButton = document.getElementById('refresh-crypto');
@@ -189,6 +199,31 @@
         await fetchQuote(symbol, market);
       });
 
+      dashboardButton.addEventListener('click', async () => {
+        const spot = document.getElementById('spot').value;
+        const strike = document.getElementById('strike').value;
+        const rate = document.getElementById('rate').value;
+        const vol = document.getElementById('vol').value;
+        const maturity = document.getElementById('maturity').value;
+        const type = optionTypeSelect.value;
+
+        dashboardSummary.textContent = 'Running compact dashboard...';
+        dashboardGrid.innerHTML = '';
+
+        try {
+          const response = await fetch('/api/dashboard', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ spot: Number(spot), strike: Number(strike), rate: Number(rate), maturity: Number(maturity), vol: Number(vol), option_type: type, series: [] })
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || 'Dashboard failed');
+          renderDashboard(data);
+        } catch (error) {
+          dashboardSummary.textContent = error.message || String(error);
+        }
+      });
+
       priceButton.addEventListener('click', async () => {
         const spot = document.getElementById('spot').value;
         const strike = document.getElementById('strike').value;
@@ -253,6 +288,24 @@
 
         drawQuoteChart(quote.series || []);
         stockResult.textContent = 'Quote loaded successfully.';
+      }
+
+      function renderDashboard(data) {
+        dashboardSummary.innerHTML = `
+          <div class="result-summary"><strong>Model price</strong><span>${formatNumber(data.modelPrice)}</span></div>
+          <div class="result-summary"><strong>Market price</strong><span>${formatNumber(data.marketPrice)}</span></div>
+          <div class="result-summary"><strong>Price gap</strong><span>${formatNumber(data.priceDifference)}</span></div>
+          <div class="result-summary"><strong>Signal</strong><span>${data.impliedVol.signal.toUpperCase()}</span></div>
+        `;
+
+        dashboardGrid.innerHTML = [
+          ['Model IV', data.impliedVol.modelIv],
+          ['Market IV', data.impliedVol.marketIv],
+          ['Vol regime', data.volatility.regime],
+          ['30d forward', data.volatility.forward30d],
+          ['Realized vol', data.volatility.realizedVol],
+          ['GK vol', data.volatility.gkVol],
+        ].map(([label, value]) => `<div class="greek-metric"><small>${label}</small><strong>${formatNumber(value)}</strong></div>`).join('');
       }
 
       function renderPricing(priceData, greeksData, series) {

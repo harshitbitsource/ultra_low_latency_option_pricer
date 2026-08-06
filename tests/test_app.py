@@ -1,7 +1,30 @@
 import json
 import unittest
 
-from app import parse_yahoo_chart_payload
+from app import (
+    build_dashboard_payload,
+    build_volatility_summary,
+    parse_yahoo_chart_payload,
+)
+
+
+class TestDashboardHelpers(unittest.TestCase):
+    def test_build_volatility_summary(self):
+        series = [
+            {"close": 100.0, "high": 101.0, "low": 99.0},
+            {"close": 102.0, "high": 104.0, "low": 100.0},
+            {"close": 101.0, "high": 103.0, "low": 100.0},
+        ]
+        summary = build_volatility_summary(series, 0.25)
+        self.assertGreater(summary["realizedVol"], 0.0)
+        self.assertIn(summary["signal"], {"buy", "sell", "neutral"})
+
+    def test_build_dashboard_payload(self):
+        payload = build_dashboard_payload(100.0, 100.0, 0.05, 1.0, 0.2, "call", [])
+        self.assertIn("modelPrice", payload)
+        self.assertIn("marketPrice", payload)
+        self.assertIn("volatility", payload)
+        self.assertIn("impliedVol", payload)
 
 
 class TestYahooChartParser(unittest.TestCase):

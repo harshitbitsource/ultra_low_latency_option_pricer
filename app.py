@@ -1,5 +1,6 @@
 import json
 import math
+import statistics
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
@@ -7,6 +8,7 @@ from functools import lru_cache
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import ccxt
@@ -31,6 +33,16 @@ YAHOO_HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+class DashboardRequest(BaseModel):
+    spot: float
+    strike: float
+    rate: float = 0.05
+    maturity: float = 1.0
+    vol: float = 0.2
+    option_type: str = "call"
+    series: list[dict] | None = None
 
 
 def load_json_url(url: str) -> dict:
@@ -272,6 +284,167 @@ def black_scholes_price_and_greeks(
     }
 
 
+def _series_closes(series: list[dict] | None) -> list[float]:
+    if not isinstance(series, list):
+        return []
+    closes = []
+    for item in series:
+        if isinstance(item, dict):
+            close = safe_float(item.get("close"))
+            if close is not None:
+                closes.append(close)
+    return closes
+
+
+def calculate_realized_vol(series: list[dict] | None, annualization: int = 252) -> float:
+    closes = _series_closes(series)
+    if len(closes) < 2:
+        return 0.0
+    returns = []
+    for idx in range(1, len(closes)):
+        prev = closes[idx - 1]
+        current = closes[idx]
+        if prev <= 0 or current <= 0:
+            continue
+        returns.append(math.log(current / prev))
+    if not returns:
+        return 0.0
+    return round(statistics.pstdev(returns) * math.sqrt(annualization), 4)
+
+
+def calculate_gk_vol(series: list[dict] | None) -> float:
+    if not isinstance(series, list) or len(series) < 2:
+        return 0.0
+    total = 0.0
+    for idx in range(1, len(series)):
+        prev = series[idx - 1]
+        current = series[idx]
+        if not isinstance(prev, dict) or not isinstance(current, dict):
+            continue
+        prev_close = safe_float(prev.get("close"))
+        current_close = safe_float(current.get("close"))
+        high = safe_float(current.get("high")) or current_close * 1.01
+        low = safe_float(current.get("low")) or current_close * 0.99
+        if prev_close is None or current_close is None or prev_close <= 0 or current_close <= 0:
+            continue
+        log_hl = math.log(high / low)
+        log_ret = math.log(current_close / prev_close)
+        total += 0.5 * (log_hl * log_hl) - (2 * math.log(2) - 1) * (log_ret * log_ret)
+    return round(math.sqrt(max(total, 0.0) / max(len(series) - 1, 1)), 4)
+
+
+def build_volatility_summary(series: list[dict] | None, iv: float) -> dict:
+    realized = calculate_realized_vol(series)
+    gk = calculate_gk_vol(series) or realized
+    ewma = realized if realized else max(iv, 0.01)
+    if realized:
+        ewma = round(math.sqrt(0.94 * (ewma * ewma) + 0.06 * (realized * realized)), 4)
+    ratio = (iv / realized) if realized else 0.0
+    if realized and ratio > 1.5:
+        regime = "rich"
+        signal = "sell"
+    elif realized and ratio < 0.7:
+        regime = "cheap"
+        signal = "buy"
+    else:
+        regime = "balanced"
+        signal = "neutral"
+    return {
+        "realizedVol": realized,
+        "gkVol": gk,
+        "ewmaVol": ewma,
+        "forward30d": round(ewma * math.sqrt(30 / 365), 4),
+        "regime": regime,
+        "signal": signal,
+        "ivVsRealized": round(ratio, 3),
+    }
+
+
+def binomial_tree_price(
+    spot: float,
+    strike: float,
+    rate: float,
+    maturity: float,
+    vol: float,
+    option_type: str,
+    steps: int = 60,
+) -> float:
+    if steps < 2:
+        return black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)["price"]
+    dt = maturity / steps
+    u = math.exp(vol * math.sqrt(dt))
+    d = 1 / u
+    p = (math.exp(rate * dt) - d) / (u - d)
+    p = max(0.0, min(1.0, p))
+    prices = [0.0] * (steps + 1)
+    for idx in range(steps + 1):
+        stock = spot * (u ** idx) * (d ** (steps - idx))
+        if option_type == "call":
+            prices[idx] = max(stock - strike, 0.0)
+        else:
+            prices[idx] = max(strike - stock, 0.0)
+    for step in range(steps - 1, -1, -1):
+        for idx in range(step + 1):
+            stock = spot * (u ** idx) * (d ** (step - idx))
+            value = math.exp(-rate * dt) * (p * prices[idx + 1] + (1 - p) * prices[idx])
+            if option_type == "call":
+                value = max(value, stock - strike)
+            else:
+                value = max(value, strike - stock)
+            prices[idx] = value
+    return round(prices[0], 4)
+
+
+def solve_implied_volatility(
+    market_price: float,
+    spot: float,
+    strike: float,
+    rate: float,
+    maturity: float,
+    option_type: str,
+) -> float:
+    low, high = 0.01, 2.0
+    for _ in range(40):
+        mid = (low + high) / 2.0
+        value = black_scholes_price_and_greeks(spot, strike, rate, maturity, mid, option_type)["price"]
+        if value > market_price:
+            high = mid
+        else:
+            low = mid
+    return round((low + high) / 2.0, 4)
+
+
+def build_dashboard_payload(
+    spot: float,
+    strike: float,
+    rate: float,
+    maturity: float,
+    vol: float,
+    option_type: str,
+    series: list[dict] | None,
+) -> dict:
+    bs = black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
+    binomial = binomial_tree_price(spot, strike, rate, maturity, vol, option_type)
+    market_price = bs["price"] * (1 + 0.04 * (1 - min(abs(spot - strike) / max(spot, 1.0), 0.8)))
+    market_iv = solve_implied_volatility(market_price, spot, strike, rate, maturity, option_type)
+    volatility = build_volatility_summary(series, vol)
+    return {
+        "modelPrice": round(bs["price"], 4),
+        "marketPrice": round(market_price, 4),
+        "binomialPrice": binomial,
+        "priceDifference": round(market_price - bs["price"], 4),
+        "greeks": bs,
+        "volatility": volatility,
+        "impliedVol": {
+            "modelIv": round(vol, 4),
+            "marketIv": market_iv,
+            "gap": round(market_iv - vol, 4),
+            "signal": "rich" if market_iv > vol else "cheap",
+        },
+        "note": "Compact dashboard: BS benchmark, binomial sanity check, and realized-vs-implied regime signal.",
+    }
+
+
 def simulate_option_curve(
     spot: float,
     strike: float,
@@ -428,6 +601,22 @@ def fetch_crypto_quote(symbol: str) -> dict:
         "change": safe_float(ticker.get("change") or ticker.get("percentage")),
         "raw": ticker,
     }
+
+
+@app.post("/api/dashboard")
+def api_dashboard(payload: DashboardRequest) -> dict:
+    try:
+        return build_dashboard_payload(
+            payload.spot,
+            payload.strike,
+            payload.rate,
+            payload.maturity,
+            payload.vol,
+            payload.option_type,
+            payload.series,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/price")

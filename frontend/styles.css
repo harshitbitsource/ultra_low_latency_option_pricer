@@ -29,6 +29,8 @@ button:hover { filter: brightness(1.05); }
 .quote-chart { width: 100%; border-radius: 18px; background: rgba(15, 23, 42, 0.9); margin-bottom: 16px; display: block; }
 .result-box { white-space: pre-wrap; background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.12); border-radius: 18px; padding: 18px; min-height: 160px; margin: 0; color: #e2e8f0; }
 .greek-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
+#dashboard-summary { min-height: 140px; }
+#dashboard-button { margin-bottom: 14px; }
 .greek-metric { padding: 14px 16px; border-radius: 16px; background: rgba(31, 41, 55, 0.95); border: 1px solid rgba(148, 163, 184, 0.14); }
 .greek-metric small { display: block; color: #94a3b8; margin-bottom: 6px; }
 .greek-metric strong { font-size: 1.1rem; color: #f8fafc; }
