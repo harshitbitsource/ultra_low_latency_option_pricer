@@ -1,4 +1,6 @@
 import json
+import csv
+import io
 import math
 import random
 import statistics
@@ -35,6 +37,8 @@ YAHOO_HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
+NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+NSE_LIST_HEADERS = {**YAHOO_HEADERS, "Referer": "https://www.nseindia.com/"}
 
 
 class DashboardRequest(BaseModel):
@@ -52,15 +56,19 @@ class AnalyticsRequest(DashboardRequest):
     strategy: str = "long_call"
 
 
-def load_json_url(url: str) -> dict:
-    request = Request(url, headers=YAHOO_HEADERS)
+def load_url(url: str, headers: dict | None = None) -> bytes:
+    request = Request(url, headers=headers or YAHOO_HEADERS)
     try:
         with urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return response.read()
     except HTTPError as exc:
         raise ValueError(f"Yahoo API failed: {exc.code} {exc.reason}")
     except URLError as exc:
         raise ValueError(f"Yahoo API failed: {exc.reason}")
+
+
+def load_json_url(url: str) -> dict:
+    return json.loads(load_url(url).decode("utf-8"))
 
 
 def build_yahoo_symbol(symbol: str) -> str:
@@ -213,10 +221,22 @@ def safe_float(value, default=None):
 
 
 @lru_cache(maxsize=1)
-def get_nse_symbol_list() -> list[str]:
+def get_nse_equities() -> list[dict]:
+    """Return the official NSE equity master list, with a library fallback."""
     try:
-        payload = nse_eq_symbols()
-        return sorted(payload) if isinstance(payload, list) else []
+        text = load_url(NSE_EQUITY_LIST_URL, NSE_LIST_HEADERS).decode("utf-8-sig")
+        rows = csv.DictReader(io.StringIO(text))
+        equities = [
+            {"symbol": row["SYMBOL"].strip(), "name": row.get("NAME OF COMPANY", "").strip(),
+             "series": row.get(" SERIES", row.get("SERIES", "")).strip()}
+            for row in rows if row.get("SYMBOL", "").strip()
+        ]
+        if equities:
+            return sorted(equities, key=lambda item: item["symbol"])
+    except Exception:
+        pass
+    try:
+        return [{"symbol": symbol, "name": "", "series": "EQ"} for symbol in sorted(nse_eq_symbols())]
     except Exception:
         return []
 
@@ -234,11 +254,15 @@ def get_crypto_symbol_list() -> list[str]:
 
 @app.get("/api/nse-symbols")
 def api_nse_symbols(q: str = Query("", alias="q")) -> dict:
-    symbols = get_nse_symbol_list()
-    if q:
-        query = q.strip().upper()
-        symbols = [symbol for symbol in symbols if query in symbol]
-    return {"symbols": symbols[:800], "total": len(symbols)}
+    equities = get_nse_equities()
+    query = q.strip().upper()
+    if query:
+        # Symbol matches come first, then company-name matches.
+        equities = [item for item in equities if query in item["symbol"] or query in item["name"].upper()]
+        equities.sort(key=lambda item: (not item["symbol"].startswith(query), item["symbol"]))
+    # The unfiltered endpoint is the complete NSE equity list; the UI caps only
+    # the visible autocomplete menu, not the available universe.
+    return {"stocks": equities, "total": len(equities)}
 
 
 @app.get("/api/crypto-symbols")
