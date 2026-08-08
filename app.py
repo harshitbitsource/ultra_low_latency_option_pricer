@@ -149,8 +149,14 @@ def parse_yahoo_chart_payload(payload: dict, symbol: str) -> dict:
 def fetch_yahoo_equity_quote(symbol: str) -> dict:
     symbol_value = symbol.strip().upper()
     if not symbol_value.endswith(".NS"):
-        symbol_value = search_yahoo_equity_symbol(symbol_value)
-
+        # NSE symbols normally map directly to SYMBOL.NS (including BEL, RIL
+        # and TCS). Searching first incorrectly rejects valid short symbols.
+        direct_symbol = build_yahoo_symbol(symbol_value)
+        try:
+            payload = load_json_url(YAHOO_CHART_URL.format(symbol=direct_symbol))
+            return parse_yahoo_chart_payload(payload, direct_symbol)
+        except ValueError:
+            symbol_value = search_yahoo_equity_symbol(symbol_value)
     payload = load_json_url(YAHOO_CHART_URL.format(symbol=symbol_value))
     return parse_yahoo_chart_payload(payload, symbol_value)
 
