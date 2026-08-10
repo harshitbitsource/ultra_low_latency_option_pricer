@@ -82,6 +82,9 @@
     byId("vol-regime").textContent = data.volatility.regime;
     byId("vol-regime").className = `pill ${data.volatility.regime}`;
     byId("vol-info").innerHTML = [["Garman–Klass", percent(data.volatility.gkVol)], ["30d forecast", percent(data.volatility.forward30d)], ["IV / RV", `${number(data.volatility.ivVsRealized)}×`]].map(([label, value]) => `<span>${label} <b>${value}</b></span>`).join("");
+    const models = [["blue", "Black–Scholes", "European benchmark", data.models.blackScholes], ["purple", "Binomial tree", "American exercise", data.models.binomialAmerican], ["green", "Monte Carlo", "Antithetic variates", data.models.monteCarloAntithetic]];
+    byId("models").innerHTML = models.map(([colour, name, description, price], index) => `<div class="model-row ${index === 0 ? "featured" : ""}"><span class="model-dot ${colour}"></span><div><b>${name}</b><small>${description}</small></div><strong>₹ ${number(price)}</strong></div>`).join("");
+    byId("model-note").textContent = `Binomial premium: ₹ ${number(data.models.binomialAmerican - data.models.blackScholes)} · Market-model gap: ₹ ${number(data.priceDifference)}`;
     byId("greek-cards").innerHTML = Object.entries(data.greeks).map(([name, value]) => `<article><small>${name}</small><strong>${number(value)}</strong><span>${name === "theta" ? "daily decay" : name === "vega" ? "per 1% vol" : "current exposure"}</span></article>`).join("");
     const title = greek[0].toUpperCase() + greek.slice(1);
     byId("surface-title").textContent = `${title} surface`;
@@ -92,10 +95,16 @@
     byId("strategy-title").textContent = `${strategy.options[strategy.selectedIndex]?.text || "Strategy"} payoff`;
     const loss = Math.abs(Math.min(...data.payoff.map((point) => point.pnl)));
     byId("payoff-metrics").innerHTML = `<span>Max loss <b>₹ ${number(loss)}</b></span><span>Break-even <b>₹ ${number(Number(byId("strike").value) + data.modelPrice)}</b></span><span>Max gain <b>${data.strategy === "long_call" ? "Unlimited" : "Varies"}</b></span>`;
-    const v = volatilityRows(data);
-    drawChart("payoff-chart", data.payoff, "pnl", "#73a7ff", { zero: true });
-    drawChart("greek-chart", data.surface.filter((row) => row.dte === 30).map((row) => ({ value: row[greek] })), "value", "#b28cff", { zero: greek === "theta" });
-    drawChart("vol-chart", v, "iv", "#b28cff", { overlay: v.map(({ rv }) => ({ iv: rv })) });
+    // Wait for the DOM paint before measuring a responsive canvas.  Measuring
+    // during a layout update was yielding a zero-width drawing buffer in some
+    // browsers, so the cards appeared empty even though the API had returned.
+    requestAnimationFrame(() => {
+      if (result !== data) return;
+      const v = volatilityRows(data);
+      drawChart("payoff-chart", data.payoff, "pnl", "#73a7ff", { zero: true });
+      drawChart("greek-chart", data.surface.filter((row) => row.dte === 30).map((row) => ({ value: row[greek] })), "value", "#b28cff", { zero: greek === "theta" });
+      drawChart("vol-chart", v, "iv", "#b28cff", { overlay: v.map(({ rv }) => ({ iv: rv })) });
+    });
     updateScenario();
   }
 
@@ -120,7 +129,37 @@
     }
   }
 
+  async function loadQuote() {
+    const symbol = byId("symbol").value.trim();
+    if (!symbol) return;
+    const button = byId("quote-btn");
+    button.disabled = true;
+    button.textContent = "Loading…";
+    try {
+      const response = await fetch(`/api/stock?market=equity&symbol=${encodeURIComponent(symbol)}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Quote unavailable");
+      const quote = payload.quote;
+      byId("spot").value = quote.lastPrice;
+      byId("quote-symbol").textContent = quote.symbol;
+      byId("quote-last").textContent = `₹ ${number(quote.lastPrice)}`;
+      byId("quote-change").textContent = quote.change == null ? "Quote loaded" : `${quote.change >= 0 ? "▲" : "▼"} ${number(quote.change)}`;
+      byId("quote-stats").innerHTML = [["Open", quote.openPrice], ["High", quote.highPrice], ["Low", quote.lowPrice]].map(([label, value]) => `<span>${label} <b>₹ ${number(value)}</b></span>`).join("");
+      requestAnimationFrame(() => drawChart("quote-chart", quote.series || [], "close", quote.change >= 0 ? "#47d7a1" : "#fb7185"));
+      runAnalysis();
+    } catch (error) {
+      byId("quote-change").textContent = error.message;
+    } finally {
+      button.disabled = false;
+      button.textContent = "Fetch quote";
+    }
+  }
+
   ["run-btn", "run-top", "run-hero", "refresh-btn"].forEach((id) => { byId(id).onclick = runAnalysis; });
+  byId("quote-btn").onclick = loadQuote;
+  byId("symbol").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); loadQuote(); }
+  });
   byId("strategy").onchange = runAnalysis;
   byId("spot-shock").oninput = updateScenario;
   byId("iv-shock").oninput = updateScenario;
