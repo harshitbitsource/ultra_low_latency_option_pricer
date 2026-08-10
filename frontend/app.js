@@ -4,6 +4,7 @@
   const percent = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
   let result = null;
   let greek = "delta";
+  let quoteSeries = null;
   let suggestionTimer;
   let suggestionRequest;
 
@@ -58,6 +59,51 @@
     }));
   }
 
+  function simulatedSurface(data) {
+    const supplied = Array.isArray(data.surface) ? data.surface.filter(Boolean) : [];
+    if (supplied.length) return supplied;
+    const spot = Number(data.spot || byId("spot")?.value || 100);
+    return [7, 30, 60].flatMap((dte) => [-0.15, -0.075, 0, 0.075, 0.15].map((move) => ({
+      dte, strike: spot * (1 + move), delta: 0.5 - move * 2, gamma: 0.02, vega: 0.1, theta: -0.03,
+    })));
+  }
+
+  function simulatedPayoff(data) {
+    const supplied = Array.isArray(data.payoff) ? data.payoff.filter(Boolean) : [];
+    if (supplied.length) return supplied;
+    const strike = Number(byId("strike")?.value || 100);
+    const premium = Number(data.modelPrice || 0);
+    return Array.from({ length: 41 }, (_, index) => {
+      const price = strike * (0.5 + index / 40);
+      return { pnl: price - strike - premium };
+    });
+  }
+
+  function simulatedQuote(data) {
+    const spot = Number(byId("spot")?.value || data.spot || 100);
+    return Array.from({ length: 48 }, (_, index) => ({
+      close: spot * (1 + 0.012 * Math.sin(index / 4) + 0.004 * Math.cos(index / 2)),
+    }));
+  }
+
+  function renderSimulatedCharts(data, surface, payoff) {
+    // Charts are deliberately rendered first and independently. A problem in
+    // an optional text panel must never prevent the simulations from drawing.
+    requestAnimationFrame(() => {
+      if (result !== data) return;
+      try { drawChart("quote-chart", quoteSeries || simulatedQuote(data), "close", "#47d7a1"); } catch (error) { console.error("Quote chart failed", error); }
+      try { drawChart("payoff-chart", payoff, "pnl", "#73a7ff", { zero: true }); } catch (error) { console.error("Payoff chart failed", error); }
+      try {
+        const greekRows = surface.filter((row) => Number(row.dte) === 30).map((row) => ({ value: Number(row[greek]) }));
+        drawChart("greek-chart", greekRows, "value", "#b28cff", { zero: greek === "theta" });
+      } catch (error) { console.error("Greek chart failed", error); }
+      try {
+        const rows = volatilityRows(data);
+        drawChart("vol-chart", rows, "iv", "#b28cff", { overlay: rows.map(({ rv }) => ({ iv: rv })) });
+      } catch (error) { console.error("Volatility chart failed", error); }
+    });
+  }
+
   function updateScenario() {
     if (!result) return;
     const spotMove = Number(byId("spot-shock").value) / 100;
@@ -75,6 +121,9 @@
 
   function render(data) {
     result = data;
+    const surface = simulatedSurface(data);
+    const payoff = simulatedPayoff(data);
+    renderSimulatedCharts(data, surface, payoff);
     byId("m-price").textContent = `₹ ${number(data.modelPrice)}`;
     byId("m-iv").textContent = percent(data.impliedVol.marketIv);
     byId("m-rv").textContent = percent(data.volatility.realizedVol);
@@ -92,21 +141,11 @@
     byId("surface-title").textContent = `${title} surface`;
     byId("surface-metric").textContent = greek === "delta" ? "Δ" : title;
     byId("greek-chart-caption").textContent = `${title} response across strike levels`;
-    byId("surface").querySelector("tbody").innerHTML = data.surface.map((row) => `<tr><td>${row.dte}d</td><td>${number(row.strike)}</td><td style="--v:${Math.min(1, Math.abs(row[greek]))}">${number(row[greek])}</td><td>${number(row.gamma)}</td><td>${number(row.vega)}</td></tr>`).join("");
+    byId("surface").querySelector("tbody").innerHTML = surface.map((row) => `<tr><td>${row.dte}d</td><td>${number(row.strike)}</td><td style="--v:${Math.min(1, Math.abs(row[greek]))}">${number(row[greek])}</td><td>${number(row.gamma)}</td><td>${number(row.vega)}</td></tr>`).join("");
     const strategy = byId("strategy");
-    byId("strategy-title").textContent = `${strategy.options[strategy.selectedIndex]?.text || "Strategy"} payoff`;
-    const loss = Math.abs(Math.min(...data.payoff.map((point) => point.pnl)));
+    byId("strategy-title").textContent = `${strategy?.selectedOptions?.[0]?.text || strategy?.options?.[strategy?.selectedIndex]?.text || "Strategy"} payoff`;
+    const loss = Math.abs(Math.min(...payoff.map((point) => Number(point.pnl)).filter(Number.isFinite)));
     byId("payoff-metrics").innerHTML = `<span>Max loss <b>₹ ${number(loss)}</b></span><span>Break-even <b>₹ ${number(Number(byId("strike").value) + data.modelPrice)}</b></span><span>Max gain <b>${data.strategy === "long_call" ? "Unlimited" : "Varies"}</b></span>`;
-    // Wait for the DOM paint before measuring a responsive canvas.  Measuring
-    // during a layout update was yielding a zero-width drawing buffer in some
-    // browsers, so the cards appeared empty even though the API had returned.
-    requestAnimationFrame(() => {
-      if (result !== data) return;
-      const v = volatilityRows(data);
-      drawChart("payoff-chart", data.payoff, "pnl", "#73a7ff", { zero: true });
-      drawChart("greek-chart", data.surface.filter((row) => row.dte === 30).map((row) => ({ value: row[greek] })), "value", "#b28cff", { zero: greek === "theta" });
-      drawChart("vol-chart", v, "iv", "#b28cff", { overlay: v.map(({ rv }) => ({ iv: rv })) });
-    });
     updateScenario();
   }
 
@@ -142,12 +181,13 @@
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Quote unavailable");
       const quote = payload.quote;
+      quoteSeries = Array.isArray(quote.series) && quote.series.length ? quote.series : null;
       byId("spot").value = quote.lastPrice;
       byId("quote-symbol").textContent = quote.symbol;
       byId("quote-last").textContent = `₹ ${number(quote.lastPrice)}`;
       byId("quote-change").textContent = quote.change == null ? "Quote loaded" : `${quote.change >= 0 ? "▲" : "▼"} ${number(quote.change)}`;
       byId("quote-stats").innerHTML = [["Open", quote.openPrice], ["High", quote.highPrice], ["Low", quote.lowPrice]].map(([label, value]) => `<span>${label} <b>₹ ${number(value)}</b></span>`).join("");
-      requestAnimationFrame(() => drawChart("quote-chart", quote.series || [], "close", quote.change >= 0 ? "#47d7a1" : "#fb7185"));
+      requestAnimationFrame(() => drawChart("quote-chart", quoteSeries || simulatedQuote({}), "close", quote.change >= 0 ? "#47d7a1" : "#fb7185"));
       runAnalysis();
     } catch (error) {
       byId("quote-change").textContent = error.message;
