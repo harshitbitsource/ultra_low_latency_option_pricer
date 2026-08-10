@@ -2,6 +2,9 @@
   const byId = (id) => document.getElementById(id);
   const number = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 });
   const percent = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  }[character]));
   let result = null;
   let greek = "delta";
   let quoteSeries = null;
@@ -136,7 +139,7 @@
     const models = [["blue", "Black–Scholes", "European benchmark", data.models.blackScholes], ["purple", "Binomial tree", "American exercise", data.models.binomialAmerican], ["green", "Monte Carlo", "Antithetic variates", data.models.monteCarloAntithetic]];
     byId("models").innerHTML = models.map(([colour, name, description, price], index) => `<div class="model-row ${index === 0 ? "featured" : ""}"><span class="model-dot ${colour}"></span><div><b>${name}</b><small>${description}</small></div><strong>₹ ${number(price)}</strong></div>`).join("");
     byId("model-note").textContent = `Binomial premium: ₹ ${number(data.models.binomialAmerican - data.models.blackScholes)} · Market-model gap: ₹ ${number(data.priceDifference)}`;
-    byId("greek-cards").innerHTML = Object.entries(data.greeks).map(([name, value]) => `<article><small>${name}</small><strong>${number(value)}</strong><span>${name === "theta" ? "daily decay" : name === "vega" ? "per 1% vol" : "current exposure"}</span></article>`).join("");
+    byId("greek-cards").innerHTML = Object.entries(data.greeks).map(([name, value]) => `<article><small>${name}</small><strong>${number(value)}</strong><span>${name === "theta" ? "annual time decay" : name === "vega" ? "volatility sensitivity" : "current exposure"}</span></article>`).join("");
     const title = greek[0].toUpperCase() + greek.slice(1);
     byId("surface-title").textContent = `${title} surface`;
     byId("surface-metric").textContent = greek === "delta" ? "Δ" : title;
@@ -216,7 +219,7 @@
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Symbol search unavailable");
       const stocks = payload.stocks || [];
-      menu.innerHTML = stocks.slice(0, 8).map((stock) => `<button type="button" data-symbol="${stock.symbol}"><b>${stock.symbol}</b><span>${stock.name || "NSE Equity"}</span></button>`).join("") || "<p>No NSE equity found</p>";
+      menu.innerHTML = stocks.slice(0, 8).map((stock) => `<button type="button" data-symbol="${escapeHtml(stock.symbol)}"><b>${escapeHtml(stock.symbol)}</b><span>${escapeHtml(stock.name || "NSE Equity")}</span></button>`).join("") || "<p>No NSE equity found</p>";
       menu.querySelectorAll("button[data-symbol]").forEach((button) => button.addEventListener("click", () => {
         input.value = button.dataset.symbol;
         menu.innerHTML = "";

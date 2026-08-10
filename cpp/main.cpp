@@ -2,6 +2,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <numbers>
 #include <string>
 
 [[gnu::always_inline]] inline double normal_cdf(double x) {
@@ -12,8 +14,8 @@
     const double a5 = 1.330274429;
     const double p = 0.2316419;
     const double t = 1.0 / (1.0 + p * std::abs(x));
-    const double poly = (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) + 1.0;
-    const double cdf = 1.0 - (1.0 / std::sqrt(2.0 * M_PI)) * std::exp(-0.5 * x * x) * poly;
+    const double poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    const double cdf = 1.0 - std::exp(-0.5 * x * x) * poly / std::sqrt(2.0 * std::numbers::pi);
     return x >= 0.0 ? cdf : 1.0 - cdf;
 }
 
@@ -53,7 +55,18 @@ int main(int argc, char** argv) {
     const double maturity = parse_double("--maturity", argv, argc, 1.0);
     const double vol = parse_double("--vol", argv, argc, 0.2);
     const std::string type = parse_string("--type", argv, argc, "call");
-    const long long iterations = static_cast<long long>(parse_double("--iterations", argv, argc, 100000.0));
+    const double requested_iterations = parse_double("--iterations", argv, argc, 100000.0);
+
+    if (!std::isfinite(spot) || !std::isfinite(strike) || !std::isfinite(rate) ||
+        !std::isfinite(maturity) || !std::isfinite(vol) || spot <= 0.0 || strike <= 0.0 ||
+        maturity <= 0.0 || vol <= 0.0 || !std::isfinite(requested_iterations) ||
+        requested_iterations <= 0.0 || requested_iterations > std::numeric_limits<long long>::max() ||
+        std::floor(requested_iterations) != requested_iterations || (type != "call" && type != "put")) {
+        std::cerr << "Invalid inputs: spot, strike, maturity and volatility must be positive; "
+                  << "iterations must be a positive integer; type must be call or put.\n";
+        return EXIT_FAILURE;
+    }
+    const long long iterations = static_cast<long long>(requested_iterations);
 
     const bool is_call = type == "call";
     const auto start = std::chrono::high_resolution_clock::now();

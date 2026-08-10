@@ -6,13 +6,14 @@ import random
 import statistics
 import time
 from pathlib import Path
+from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from functools import lru_cache
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import ccxt
@@ -42,18 +43,18 @@ NSE_LIST_HEADERS = {**YAHOO_HEADERS, "Referer": "https://www.nseindia.com/"}
 
 
 class DashboardRequest(BaseModel):
-    spot: float
-    strike: float
-    rate: float = 0.05
-    maturity: float = 1.0
-    vol: float = 0.2
-    option_type: str = "call"
+    spot: float = Field(gt=0)
+    strike: float = Field(gt=0)
+    rate: float = Field(default=0.05, ge=0)
+    maturity: float = Field(default=1.0, gt=0)
+    vol: float = Field(default=0.2, gt=0)
+    option_type: Literal["call", "put"] = "call"
     series: list[dict] | None = None
 
 
 class AnalyticsRequest(DashboardRequest):
     model: str = "black_scholes"
-    strategy: str = "long_call"
+    strategy: Literal["long_call", "long_put", "short_call", "short_put", "straddle", "collar"] = "long_call"
 
 
 def load_url(url: str, headers: dict | None = None) -> bytes:
@@ -122,8 +123,10 @@ def parse_yahoo_chart_payload(payload: dict, symbol: str) -> dict:
         last_price = next((safe_float(x) for x in reversed(closes) if x is not None), None)
 
     open_price = safe_float(meta.get("open")) or next((safe_float(x) for x in opens if x is not None), None)
-    high_price = safe_float(max((x for x in highs if x is not None), default=None))
-    low_price = safe_float(min((x for x in lows if x is not None), default=None))
+    valid_highs = [value for value in (safe_float(x) for x in highs) if value is not None]
+    valid_lows = [value for value in (safe_float(x) for x in lows) if value is not None]
+    high_price = max(valid_highs, default=None)
+    low_price = min(valid_lows, default=None)
     prev_close = safe_float(meta.get("previousClose") or meta.get("chartPreviousClose"))
     change = safe_float(last_price - prev_close) if last_price is not None and prev_close is not None else None
 
@@ -162,7 +165,8 @@ def fetch_yahoo_equity_quote(symbol: str) -> dict:
 
 
 def build_pricer() -> None:
-    if not BINARY_PATH.exists():
+    source_path = CPP_DIR / "main.cpp"
+    if not BINARY_PATH.exists() or BINARY_PATH.stat().st_mtime < source_path.stat().st_mtime:
         subprocess.run(["make"], cwd=CPP_DIR, check=True)
     if not BINARY_PATH.exists():
         raise RuntimeError("Pricing binary could not be built")
@@ -221,8 +225,9 @@ def run_pricer(
 
 def safe_float(value, default=None):
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -288,7 +293,7 @@ def black_scholes_price_and_greeks(
     vol: float,
     option_type: str,
 ) -> dict:
-    if spot <= 0 or strike <= 0 or vol <= 0 or maturity <= 0:
+    if spot <= 0 or strike <= 0 or vol <= 0 or maturity <= 0 or option_type not in {"call", "put"}:
         raise ValueError("Invalid inputs for Black-Scholes calculation")
 
     d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * maturity) / (vol * math.sqrt(maturity))
@@ -657,7 +662,7 @@ def api_greeks(
     rate: float = Query(0.05, ge=0.0),
     maturity: float = Query(1.0, gt=0.0),
     vol: float = Query(0.2, gt=0.0),
-    option_type: str = Query("call", regex="^(call|put)$", alias="type"),
+    option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
 ) -> dict:
     try:
         return black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
@@ -672,7 +677,7 @@ def api_simulate(
     rate: float = Query(0.05, ge=0.0),
     maturity: float = Query(1.0, gt=0.0),
     vol: float = Query(0.2, gt=0.0),
-    option_type: str = Query("call", regex="^(call|put)$", alias="type"),
+    option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
     steps: int = Query(41, ge=5, le=201),
 ) -> dict:
     try:
@@ -775,14 +780,19 @@ def fetch_crypto_quote(symbol: str) -> dict:
 
     exchange = ccxt.binance({"enableRateLimit": True})
     ticker = exchange.fetch_ticker(symbol_value)
+    last_price = safe_float(ticker.get("last") or ticker.get("close"))
+    prev_close = safe_float(ticker.get("previousClose") or ticker.get("info", {}).get("previousClose"))
+    change = safe_float(ticker.get("change"))
+    if change is None and last_price is not None and prev_close is not None:
+        change = last_price - prev_close
     return {
         "symbol": symbol_value,
-        "lastPrice": safe_float(ticker.get("last") or ticker.get("close")),
+        "lastPrice": last_price,
         "openPrice": safe_float(ticker.get("open")),
         "highPrice": safe_float(ticker.get("high")),
         "lowPrice": safe_float(ticker.get("low")),
-        "prevClose": safe_float(ticker.get("previousClose") or ticker.get("info", {}).get("previousClose")),
-        "change": safe_float(ticker.get("change") or ticker.get("percentage")),
+        "prevClose": prev_close,
+        "change": change,
         "raw": ticker,
     }
 
@@ -834,7 +844,7 @@ def api_price(
     rate: float = Query(0.05, ge=0.0),
     maturity: float = Query(1.0, gt=0.0),
     vol: float = Query(0.2, gt=0.0),
-    option_type: str = Query("call", regex="^(call|put)$", alias="type"),
+    option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
     iterations: int = Query(100000, ge=1),
 ) -> dict:
     try:
@@ -848,7 +858,7 @@ def api_price(
 @app.get("/api/stock")
 def api_stock(
     symbol: str = Query(..., min_length=1),
-    market: str = Query("equity", regex="^(equity|crypto)$"),
+    market: str = Query("equity", pattern="^(equity|crypto)$"),
 ) -> dict:
     symbol_value = symbol.strip().upper()
     if not symbol_value:

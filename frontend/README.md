@@ -2,15 +2,21 @@
 
 ## Setup
 
-1. Open `frontend` in a terminal.
-2. Run `npm install`.
-3. Run `npm run dev`.
+The frontend is a static page served by the FastAPI application; it does not
+have an npm project or a separate development server. From the repository root:
 
-This starts both the frontend app and the backend runner server.
+```bash
+python -m pip install -r requirements.txt
+python -m uvicorn app:app --reload
+```
+
+Open `http://127.0.0.1:8000` in a browser.
 
 ## Usage
 
 - Edit the market inputs in the left panel.
-- Click `Run Pricing` to compile and execute the C++ engine automatically.
-- The computed price and elapsed benchmark time appear in the results panel.
-- The chart is generated from the same inputs for reference.
+- Click `Run analytics` to update model prices, Greeks, volatility, payoff and
+  scenario charts.
+- The C++ benchmark engine is available independently through `/api/price`.
+- Select a strategy to model its full position, including short call, short put,
+  ATM straddle and collar structures.

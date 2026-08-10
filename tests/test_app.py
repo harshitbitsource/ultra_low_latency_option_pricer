@@ -1,7 +1,10 @@
 import json
 import unittest
+from pydantic import ValidationError
 
 from app import (
+    AnalyticsRequest,
+    black_scholes_price_and_greeks,
     build_dashboard_payload,
     build_strategy_payoff,
     build_strategy_position,
@@ -28,6 +31,16 @@ class TestDashboardHelpers(unittest.TestCase):
         self.assertIn("marketPrice", payload)
         self.assertIn("volatility", payload)
         self.assertIn("impliedVol", payload)
+
+    def test_black_scholes_rejects_unknown_option_type(self):
+        with self.assertRaises(ValueError):
+            black_scholes_price_and_greeks(100.0, 100.0, 0.05, 1.0, 0.2, "invalid")
+
+    def test_analytics_request_rejects_invalid_strategy_and_inputs(self):
+        with self.assertRaises(ValidationError):
+            AnalyticsRequest(spot=0, strike=100, strategy="long_call")
+        with self.assertRaises(ValidationError):
+            AnalyticsRequest(spot=100, strike=100, strategy="unknown")
 
     def test_strategy_payoffs_and_risk_have_correct_direction(self):
         long_call = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "long_call")
@@ -99,6 +112,16 @@ class TestYahooChartParser(unittest.TestCase):
         self.assertAlmostEqual(quote["change"], -29.1, places=1)
         self.assertEqual(len(quote["series"]), 3)
         self.assertEqual(quote["series"][0], {"ts": 1785383100, "close": 2475.5})
+
+    def test_parse_yahoo_chart_ignores_non_numeric_highs_and_lows(self):
+        payload = {
+            "chart": {"result": [{"meta": {}, "timestamp": [], "indicators": {"quote": [{
+                "open": [], "high": [None, "not-a-number", 102], "low": ["bad", 98], "close": [],
+            }]}}]}
+        }
+        quote = parse_yahoo_chart_payload(payload, "TEST.NS")
+        self.assertEqual(quote["highPrice"], 102.0)
+        self.assertEqual(quote["lowPrice"], 98.0)
 
 
 if __name__ == "__main__":

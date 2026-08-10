@@ -7,7 +7,7 @@ Responsive local option-research dashboard with NSE equity quotes, model compari
 - Black–Scholes Greeks, American binomial tree, and antithetic Monte Carlo comparison
 - Strike × DTE Greek sensitivity table and interactive spot/vol/rate inputs
 - Realized/Garman–Klass volatility summary with IV-versus-realized regime flags
-- Long call, long put, straddle, and collar expiry P&L diagrams
+- Long/short call, long/short put, ATM straddle, and collar expiry P&L diagrams
 - Responsive dark/light layout for laptop, tablet, and mobile
 - Measured in-process analytics/request timing (not a misleading end-to-end latency claim)
 
