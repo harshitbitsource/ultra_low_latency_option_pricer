@@ -459,22 +459,115 @@ def build_sensitivity_surface(spot: float, strike: float, rate: float, maturity:
     return rows
 
 
-def build_strategy_payoff(spot: float, strike: float, premium: float, strategy: str) -> list[dict]:
-    points = []
-    for index in range(31):
-        terminal = spot * (0.6 + index * 0.8 / 30)
-        call = max(terminal - strike, 0.0)
-        put = max(strike - terminal, 0.0)
-        if strategy == "long_put":
-            pnl = put - premium
-        elif strategy == "straddle":
-            pnl = call + put - 2 * premium
-        elif strategy == "collar":
-            pnl = min(max(terminal - spot, -premium), premium)
+VALID_STRATEGIES = {"long_call", "long_put", "short_call", "short_put", "straddle", "collar"}
+
+
+def strategy_legs(strike: float, strategy: str) -> list[dict]:
+    """Return the tradable legs for a one-unit strategy.
+
+    A collar is one share of stock, a 5% OTM protective put and a 5% OTM
+    covered call.  The input strike is its ATM reference, so the structure
+    remains well-defined when the user changes the pricing inputs.
+    """
+    if strategy not in VALID_STRATEGIES:
+        raise ValueError(f"Unsupported strategy: {strategy}")
+    if strategy == "long_call":
+        return [{"kind": "option", "type": "call", "strike": strike, "quantity": 1}]
+    if strategy == "long_put":
+        return [{"kind": "option", "type": "put", "strike": strike, "quantity": 1}]
+    if strategy == "short_call":
+        return [{"kind": "option", "type": "call", "strike": strike, "quantity": -1}]
+    if strategy == "short_put":
+        return [{"kind": "option", "type": "put", "strike": strike, "quantity": -1}]
+    if strategy == "straddle":
+        return [
+            {"kind": "option", "type": "call", "strike": strike, "quantity": 1},
+            {"kind": "option", "type": "put", "strike": strike, "quantity": 1},
+        ]
+    return [
+        {"kind": "stock", "quantity": 1},
+        {"kind": "option", "type": "put", "strike": strike * 0.95, "quantity": 1},
+        {"kind": "option", "type": "call", "strike": strike * 1.05, "quantity": -1},
+    ]
+
+
+def build_strategy_position(spot: float, strike: float, rate: float, maturity: float,
+                            vol: float, strategy: str) -> dict:
+    """Price all legs and aggregate their Black--Scholes Greeks."""
+    totals = {"price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+    legs = []
+    for leg in strategy_legs(strike, strategy):
+        quantity = leg["quantity"]
+        if leg["kind"] == "stock":
+            values = {"price": spot, "delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+            description = "Long underlying"
         else:
-            pnl = call - premium
-        points.append({"spot": round(terminal, 2), "pnl": round(pnl, 3)})
-    return points
+            values = black_scholes_price_and_greeks(
+                spot, leg["strike"], rate, maturity, vol, leg["type"]
+            )
+            description = f"{'Long' if quantity > 0 else 'Short'} {leg['type']}"
+        for name in totals:
+            totals[name] += quantity * values[name]
+        legs.append({
+            "description": description,
+            "quantity": quantity,
+            "strike": round(leg.get("strike", 0.0), 2) if leg["kind"] == "option" else None,
+            "price": round(values["price"], 4),
+        })
+    return {"cost": totals["price"], "greeks": totals, "legs": legs, "referenceStrike": strike}
+
+
+def strategy_payoff_at_expiry(terminal: float, legs: list[dict]) -> float:
+    value = 0.0
+    for leg in legs:
+        if leg["kind"] == "stock":
+            value += leg["quantity"] * terminal
+        elif leg["type"] == "call":
+            value += leg["quantity"] * max(terminal - leg["strike"], 0.0)
+        else:
+            value += leg["quantity"] * max(leg["strike"] - terminal, 0.0)
+    return value
+
+
+def build_strategy_payoff(spot: float, position: dict, strategy: str) -> list[dict]:
+    legs = strategy_legs(position["referenceStrike"], strategy)
+    return [
+        {"spot": round(terminal := spot * (0.5 + index / 40), 2),
+         "pnl": round(strategy_payoff_at_expiry(terminal, legs) - position["cost"], 3)}
+        for index in range(41)
+    ]
+
+
+def strategy_metrics(position: dict, strike: float, strategy: str) -> dict:
+    cost = position["cost"]
+    if strategy == "long_call":
+        return {"maxLoss": cost, "breakEvens": [strike + cost], "maxGain": "Unlimited"}
+    if strategy == "long_put":
+        return {"maxLoss": cost, "breakEvens": [strike - cost], "maxGain": strike - cost}
+    if strategy == "short_call":
+        return {"maxLoss": "Unlimited", "breakEvens": [strike - cost], "maxGain": -cost}
+    if strategy == "short_put":
+        return {"maxLoss": strike + cost, "breakEvens": [strike + cost], "maxGain": -cost}
+    if strategy == "straddle":
+        return {"maxLoss": cost, "breakEvens": [strike - cost, strike + cost], "maxGain": "Unlimited"}
+    put_strike, call_strike = strike * 0.95, strike * 1.05
+    return {
+        "maxLoss": max(cost - put_strike, 0.0),
+        "breakEvens": [cost],
+        "maxGain": max(call_strike - cost, 0.0),
+    }
+
+
+def build_strategy_surface(spot: float, strike: float, rate: float, maturity: float,
+                           vol: float, strategy: str) -> list[dict]:
+    rows = []
+    for dte in (7, 30, 90, 180):
+        for multiplier in (0.85, 0.925, 1.0, 1.075, 1.15):
+            row_strike = strike * multiplier
+            position = build_strategy_position(spot, row_strike, rate, dte / 365, vol, strategy)
+            rows.append({"strike": round(row_strike, 2), "dte": dte,
+                         **{key: round(value, 5) for key, value in position["greeks"].items()}})
+    return rows
 
 
 def solve_implied_volatility(
@@ -717,13 +810,16 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
         started = time.perf_counter()
         dashboard = build_dashboard_payload(payload.spot, payload.strike, payload.rate, payload.maturity,
                                             payload.vol, payload.option_type, payload.series)
-        greeks = black_scholes_price_and_greeks(payload.spot, payload.strike, payload.rate,
-                                                payload.maturity, payload.vol, payload.option_type)
+        position = build_strategy_position(payload.spot, payload.strike, payload.rate,
+                                           payload.maturity, payload.vol, payload.strategy)
         return {
             **dashboard,
-            "surface": build_sensitivity_surface(payload.spot, payload.strike, payload.rate, payload.maturity,
-                                                 payload.vol, payload.option_type),
-            "payoff": build_strategy_payoff(payload.spot, payload.strike, greeks["price"], payload.strategy),
+            "greeks": {key: round(value, 5) for key, value in position["greeks"].items()},
+            "surface": build_strategy_surface(payload.spot, payload.strike, payload.rate, payload.maturity,
+                                              payload.vol, payload.strategy),
+            "payoff": build_strategy_payoff(payload.spot, position, payload.strategy),
+            "strategyMetrics": strategy_metrics(position, payload.strike, payload.strategy),
+            "strategyLegs": position["legs"],
             "strategy": payload.strategy,
             "requestMs": round((time.perf_counter() - started) * 1000, 3),
         }

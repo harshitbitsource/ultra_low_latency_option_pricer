@@ -144,8 +144,12 @@
     byId("surface").querySelector("tbody").innerHTML = surface.map((row) => `<tr><td>${row.dte}d</td><td>${number(row.strike)}</td><td style="--v:${Math.min(1, Math.abs(row[greek]))}">${number(row[greek])}</td><td>${number(row.gamma)}</td><td>${number(row.vega)}</td></tr>`).join("");
     const strategy = byId("strategy");
     byId("strategy-title").textContent = `${strategy?.selectedOptions?.[0]?.text || strategy?.options?.[strategy?.selectedIndex]?.text || "Strategy"} payoff`;
-    const loss = Math.abs(Math.min(...payoff.map((point) => Number(point.pnl)).filter(Number.isFinite)));
-    byId("payoff-metrics").innerHTML = `<span>Max loss <b>₹ ${number(loss)}</b></span><span>Break-even <b>₹ ${number(Number(byId("strike").value) + data.modelPrice)}</b></span><span>Max gain <b>${data.strategy === "long_call" ? "Unlimited" : "Varies"}</b></span>`;
+    const metrics = data.strategyMetrics || {};
+    const money = (value) => typeof value === "string" ? value : `₹ ${number(value)}`;
+    const breakEvens = Array.isArray(metrics.breakEvens) && metrics.breakEvens.length
+      ? metrics.breakEvens.map((value) => `₹ ${number(value)}`).join(" / ")
+      : "—";
+    byId("payoff-metrics").innerHTML = `<span>Max loss <b>${money(metrics.maxLoss)}</b></span><span>Break-even <b>${breakEvens}</b></span><span>Max gain <b>${money(metrics.maxGain)}</b></span>`;
     updateScenario();
   }
 

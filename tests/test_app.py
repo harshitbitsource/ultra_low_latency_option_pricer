@@ -3,8 +3,11 @@ import unittest
 
 from app import (
     build_dashboard_payload,
+    build_strategy_payoff,
+    build_strategy_position,
     build_volatility_summary,
     parse_yahoo_chart_payload,
+    strategy_metrics,
 )
 
 
@@ -25,6 +28,31 @@ class TestDashboardHelpers(unittest.TestCase):
         self.assertIn("marketPrice", payload)
         self.assertIn("volatility", payload)
         self.assertIn("impliedVol", payload)
+
+    def test_strategy_payoffs_and_risk_have_correct_direction(self):
+        long_call = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "long_call")
+        short_call = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "short_call")
+        long_put = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "long_put")
+        short_put = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "short_put")
+
+        self.assertAlmostEqual(long_call["greeks"]["delta"], -short_call["greeks"]["delta"])
+        self.assertAlmostEqual(long_put["greeks"]["vega"], -short_put["greeks"]["vega"])
+        self.assertEqual(strategy_metrics(short_call, 100.0, "short_call")["maxLoss"], "Unlimited")
+
+    def test_straddle_loses_near_strike_and_gains_on_large_move(self):
+        position = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "straddle")
+        payoff = build_strategy_payoff(100.0, position, "straddle")
+        at_strike = min(payoff, key=lambda point: abs(point["spot"] - 100.0))
+        self.assertLess(at_strike["pnl"], 0.0)
+        self.assertGreater(payoff[0]["pnl"], at_strike["pnl"])
+        self.assertGreater(payoff[-1]["pnl"], at_strike["pnl"])
+
+    def test_collar_has_bounded_expiry_payoff(self):
+        position = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "collar")
+        payoff = build_strategy_payoff(100.0, position, "collar")
+        metrics = strategy_metrics(position, 100.0, "collar")
+        self.assertEqual(len(position["legs"]), 3)
+        self.assertLessEqual(max(point["pnl"] for point in payoff), metrics["maxGain"] + 0.01)
 
 
 class TestYahooChartParser(unittest.TestCase):
