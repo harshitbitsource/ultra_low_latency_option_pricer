@@ -4,6 +4,8 @@
   const percent = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
   let result = null;
   let greek = "delta";
+  let suggestionTimer;
+  let suggestionRequest;
 
   function drawChart(id, rows, key, colour, { zero = false, overlay } = {}) {
     const element = byId(id);
@@ -155,8 +157,38 @@
     }
   }
 
+  async function showSuggestions() {
+    const input = byId("symbol");
+    const menu = byId("symbol-suggestions");
+    const query = input.value.trim();
+    if (!query) {
+      menu.innerHTML = "";
+      return;
+    }
+    suggestionRequest?.abort();
+    suggestionRequest = new AbortController();
+    try {
+      const response = await fetch(`/api/nse-symbols?q=${encodeURIComponent(query)}`, { signal: suggestionRequest.signal });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Symbol search unavailable");
+      const stocks = payload.stocks || [];
+      menu.innerHTML = stocks.slice(0, 8).map((stock) => `<button type="button" data-symbol="${stock.symbol}"><b>${stock.symbol}</b><span>${stock.name || "NSE Equity"}</span></button>`).join("") || "<p>No NSE equity found</p>";
+      menu.querySelectorAll("button[data-symbol]").forEach((button) => button.addEventListener("click", () => {
+        input.value = button.dataset.symbol;
+        menu.innerHTML = "";
+        loadQuote();
+      }));
+    } catch (error) {
+      if (error.name !== "AbortError") menu.innerHTML = "<p>Symbol search is temporarily unavailable.</p>";
+    }
+  }
+
   ["run-btn", "run-top", "run-hero", "refresh-btn"].forEach((id) => { byId(id).onclick = runAnalysis; });
   byId("quote-btn").onclick = loadQuote;
+  byId("symbol").addEventListener("input", () => {
+    clearTimeout(suggestionTimer);
+    suggestionTimer = setTimeout(showSuggestions, 180);
+  });
   byId("symbol").addEventListener("keydown", (event) => {
     if (event.key === "Enter") { event.preventDefault(); loadQuote(); }
   });
