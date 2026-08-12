@@ -10,6 +10,8 @@
   let quoteSeries = null;
   let suggestionTimer;
   let suggestionRequest;
+  let analyticsRequest;
+  let analyticsRevision = 0;
 
   function drawChart(id, rows, key, colour, { zero = false, overlay } = {}) {
     const element = byId(id);
@@ -71,17 +73,6 @@
     })));
   }
 
-  function simulatedPayoff(data) {
-    const supplied = Array.isArray(data.payoff) ? data.payoff.filter(Boolean) : [];
-    if (supplied.length) return supplied;
-    const strike = Number(byId("strike")?.value || 100);
-    const premium = Number(data.modelPrice || 0);
-    return Array.from({ length: 41 }, (_, index) => {
-      const price = strike * (0.5 + index / 40);
-      return { pnl: price - strike - premium };
-    });
-  }
-
   function simulatedQuote(data) {
     const spot = Number(byId("spot")?.value || data.spot || 100);
     return Array.from({ length: 48 }, (_, index) => ({
@@ -89,10 +80,9 @@
     }));
   }
 
-  function renderSimulatedCharts(data, surface, payoff) {
-    // Charts are deliberately rendered first and independently. A problem in
-    // an optional text panel must never prevent the simulations from drawing.
-    requestAnimationFrame(() => {
+  function renderCharts(data, surface, payoff) {
+    // Wait for layout before sizing canvases, then redraw after a responsive reflow.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
       if (result !== data) return;
       try { drawChart("quote-chart", quoteSeries || simulatedQuote(data), "close", "#47d7a1"); } catch (error) { console.error("Quote chart failed", error); }
       try { drawChart("payoff-chart", payoff, "pnl", "#73a7ff", { zero: true }); } catch (error) { console.error("Payoff chart failed", error); }
@@ -104,18 +94,19 @@
         const rows = volatilityRows(data);
         drawChart("vol-chart", rows, "iv", "#b28cff", { overlay: rows.map(({ rv }) => ({ iv: rv })) });
       } catch (error) { console.error("Volatility chart failed", error); }
-    });
+    }));
   }
 
   function updateScenario() {
     if (!result) return;
     const spotMove = Number(byId("spot-shock").value) / 100;
     const ivMove = Number(byId("iv-shock").value) / 100;
-    const spot = Number(byId("spot").value);
+    const inputs = result.pricingInputs;
+    const spot = Number(inputs.spot);
     const shockedSpot = spot * (1 + spotMove);
-    const shockedVol = Math.max(Number(byId("vol").value) + ivMove, 0.0001);
-    const pnl = scenarioValue(result.strategyLegs, shockedSpot, Number(byId("strike").value),
-      Number(byId("rate").value), Number(byId("maturity").value), shockedVol) - Number(result.positionCost);
+    const shockedVol = Math.max(Number(inputs.vol) + ivMove, 0.0001);
+    const pnl = scenarioValue(result.strategyLegs, shockedSpot, Number(inputs.strike),
+      Number(inputs.rate), Number(inputs.maturity), shockedVol) - Number(result.positionCost);
     byId("spot-shock-value").textContent = `${(spotMove * 100).toFixed(0)}%`;
     byId("iv-shock-value").textContent = `${(ivMove * 100).toFixed(0)}%`;
     const output = byId("scenario-pnl");
@@ -159,8 +150,8 @@
   function render(data) {
     result = data;
     const surface = simulatedSurface(data);
-    const payoff = simulatedPayoff(data);
-    renderSimulatedCharts(data, surface, payoff);
+    const payoff = Array.isArray(data.payoff) ? data.payoff.filter(Boolean) : [];
+    renderCharts(data, surface, payoff);
     byId("m-price").textContent = `₹ ${number(data.modelPrice)}`;
     byId("m-iv").textContent = percent(data.impliedVol.marketIv);
     byId("m-rv").textContent = percent(data.volatility.realizedVol);
@@ -179,8 +170,11 @@
     byId("surface-metric").textContent = greek === "delta" ? "Δ" : title;
     byId("greek-chart-caption").textContent = `${title} response across strike levels`;
     byId("surface").querySelector("tbody").innerHTML = surface.map((row) => `<tr><td>${row.dte}d</td><td>${number(row.strike)}</td><td style="--v:${Math.min(1, Math.abs(row[greek]))}">${number(row[greek])}</td><td>${number(row.gamma)}</td><td>${number(row.vega)}</td></tr>`).join("");
-    const strategy = byId("strategy");
-    byId("strategy-title").textContent = `${strategy?.selectedOptions?.[0]?.text || strategy?.options?.[strategy?.selectedIndex]?.text || "Strategy"} payoff`;
+    const strategyName = {
+      long_call: "Long call", long_put: "Long put", short_call: "Short call",
+      short_put: "Short put", straddle: "ATM straddle", collar: "Collar",
+    }[data.strategy] || "Strategy";
+    byId("strategy-title").textContent = `${strategyName} payoff`;
     const metrics = data.strategyMetrics || {};
     const money = (value) => typeof value === "string" ? value : `₹ ${number(value)}`;
     const breakEvens = Array.isArray(metrics.breakEvens) && metrics.breakEvens.length
@@ -195,19 +189,29 @@
   }
 
   async function runAnalysis(event) {
+    analyticsRequest?.abort();
+    analyticsRequest = new AbortController();
+    const revision = ++analyticsRevision;
     const controls = [byId("run-btn"), byId("run-top"), byId("run-hero")];
     controls.forEach((button) => { button.disabled = true; });
     byId("request-time").textContent = "Calculating…";
     try {
-      const response = await fetch("/api/analytics", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestData()) });
+      const response = await fetch("/api/analytics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestData()),
+        signal: analyticsRequest.signal,
+      });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Analytics request failed");
-      render(payload);
+      if (revision === analyticsRevision) render(payload);
     } catch (error) {
-      byId("request-time").textContent = `Analysis failed: ${error.message}`;
-      byId("model-note").textContent = "Unable to load analytics. Check that the dashboard is opened through the FastAPI server.";
+      if (error.name !== "AbortError" && revision === analyticsRevision) {
+        byId("request-time").textContent = `Analysis failed: ${error.message}`;
+        byId("model-note").textContent = "Unable to load analytics. Check that the dashboard is opened through the FastAPI server.";
+      }
     } finally {
-      controls.forEach((button) => { button.disabled = false; });
+      if (revision === analyticsRevision) controls.forEach((button) => { button.disabled = false; });
     }
   }
 
@@ -274,6 +278,12 @@
     if (event.key === "Enter") { event.preventDefault(); loadQuote(); }
   });
   byId("strategy").onchange = runAnalysis;
+  byId("type").onchange = () => {
+    const strategy = byId("strategy");
+    if (strategy.value === "long_call" || strategy.value === "long_put") strategy.value = `long_${byId("type").value}`;
+    if (strategy.value === "short_call" || strategy.value === "short_put") strategy.value = `short_${byId("type").value}`;
+    runAnalysis();
+  };
   byId("spot-shock").oninput = updateScenario;
   byId("iv-shock").oninput = updateScenario;
   document.querySelectorAll(".segmented button").forEach((button) => button.addEventListener("click", () => {

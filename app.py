@@ -834,6 +834,13 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
             "strategyLegs": position["legs"],
             "positionCost": round(position["cost"], 5),
             "strategy": payload.strategy,
+            "pricingInputs": {
+                "spot": payload.spot,
+                "strike": payload.strike,
+                "rate": payload.rate,
+                "maturity": payload.maturity,
+                "vol": payload.vol,
+            },
             "requestMs": round((time.perf_counter() - started) * 1000, 3),
         }
     except Exception as exc:

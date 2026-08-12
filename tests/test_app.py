@@ -77,6 +77,7 @@ class TestDashboardHelpers(unittest.TestCase):
                 self.assertEqual(len(response["payoff"]), 41)
                 self.assertTrue(response["strategyLegs"])
                 self.assertIn("positionCost", response)
+                self.assertEqual(response["pricingInputs"]["spot"], 100)
                 self.assertTrue(all("kind" in leg and "quantity" in leg for leg in response["strategyLegs"]))
 
     def test_strategy_metrics_match_expiry_payoff_at_boundaries(self):
