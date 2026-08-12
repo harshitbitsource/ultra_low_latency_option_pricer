@@ -9,6 +9,7 @@ from app import (
     build_strategy_payoff,
     build_strategy_position,
     build_volatility_summary,
+    api_analytics,
     parse_yahoo_chart_payload,
     strategy_metrics,
 )
@@ -66,6 +67,30 @@ class TestDashboardHelpers(unittest.TestCase):
         metrics = strategy_metrics(position, 100.0, "collar")
         self.assertEqual(len(position["legs"]), 3)
         self.assertLessEqual(max(point["pnl"] for point in payoff), metrics["maxGain"] + 0.01)
+
+    def test_analytics_returns_repriceable_legs_for_every_strategy(self):
+        for strategy in ("long_call", "long_put", "short_call", "short_put", "straddle", "collar"):
+            with self.subTest(strategy=strategy):
+                response = api_analytics(AnalyticsRequest(
+                    spot=100, strike=100, rate=0.05, maturity=1, vol=0.25, strategy=strategy,
+                ))
+                self.assertEqual(len(response["payoff"]), 41)
+                self.assertTrue(response["strategyLegs"])
+                self.assertIn("positionCost", response)
+                self.assertTrue(all("kind" in leg and "quantity" in leg for leg in response["strategyLegs"]))
+
+    def test_strategy_metrics_match_expiry_payoff_at_boundaries(self):
+        position = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.25, "collar")
+        payoff = build_strategy_payoff(100.0, position, "collar")
+        metrics = strategy_metrics(position, 100.0, "collar")
+        self.assertAlmostEqual(min(point["pnl"] for point in payoff), -metrics["maxLoss"], places=3)
+        self.assertAlmostEqual(max(point["pnl"] for point in payoff), metrics["maxGain"], places=3)
+
+    def test_request_bounds_reject_extreme_model_inputs(self):
+        for values in ({"rate": 1.1}, {"maturity": 31}, {"vol": 10.1}):
+            with self.subTest(values=values):
+                with self.assertRaises(ValidationError):
+                    AnalyticsRequest(spot=100, strike=100, **values)
 
 
 class TestYahooChartParser(unittest.TestCase):

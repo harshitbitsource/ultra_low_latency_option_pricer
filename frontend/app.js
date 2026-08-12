@@ -112,14 +112,48 @@
     const spotMove = Number(byId("spot-shock").value) / 100;
     const ivMove = Number(byId("iv-shock").value) / 100;
     const spot = Number(byId("spot").value);
-    const g = result.greeks;
-    const pnl = g.delta * spot * spotMove + 0.5 * g.gamma * (spot * spotMove) ** 2 + g.vega * ivMove;
+    const shockedSpot = spot * (1 + spotMove);
+    const shockedVol = Math.max(Number(byId("vol").value) + ivMove, 0.0001);
+    const pnl = scenarioValue(result.strategyLegs, shockedSpot, Number(byId("strike").value),
+      Number(byId("rate").value), Number(byId("maturity").value), shockedVol) - Number(result.positionCost);
     byId("spot-shock-value").textContent = `${(spotMove * 100).toFixed(0)}%`;
     byId("iv-shock-value").textContent = `${(ivMove * 100).toFixed(0)}%`;
     const output = byId("scenario-pnl");
     output.textContent = `${pnl >= 0 ? "+" : ""}₹ ${number(pnl)}`;
     output.className = pnl >= 0 ? "gain" : "loss";
-    byId("vega-limit").textContent = number(g.vega);
+    byId("vega-limit").textContent = number(result.greeks.vega);
+  }
+
+  function normalCdf(value) {
+    return 0.5 * (1 + erf(value / Math.sqrt(2)));
+  }
+
+  function erf(value) {
+    const sign = value < 0 ? -1 : 1;
+    const x = Math.abs(value);
+    const t = 1 / (1 + 0.3275911 * x);
+    const polynomial = (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t);
+    return sign * (1 - polynomial * Math.exp(-x * x));
+  }
+
+  function blackScholesValue(spot, strike, rate, maturity, vol, type) {
+    const sqrtMaturity = Math.sqrt(maturity);
+    const d1 = (Math.log(spot / strike) + (rate + 0.5 * vol ** 2) * maturity) / (vol * sqrtMaturity);
+    const d2 = d1 - vol * sqrtMaturity;
+    const discount = Math.exp(-rate * maturity);
+    if (type === "call") return spot * normalCdf(d1) - strike * discount * normalCdf(d2);
+    return strike * discount * normalCdf(-d2) - spot * normalCdf(-d1);
+  }
+
+  function scenarioValue(legs, spot, referenceStrike, rate, maturity, vol) {
+    if (!Array.isArray(legs)) return Number.NaN;
+    return legs.reduce((total, leg) => {
+      const quantity = Number(leg.quantity);
+      if (!Number.isFinite(quantity)) return total;
+      if (leg.kind === "stock") return total + quantity * spot;
+      const strike = Number(leg.strike || referenceStrike);
+      return total + quantity * blackScholesValue(spot, strike, rate, maturity, vol, leg.type);
+    }, 0);
   }
 
   function render(data) {
@@ -157,7 +191,7 @@
   }
 
   function requestData() {
-    return { spot: Number(byId("spot").value), strike: Number(byId("strike").value), vol: Number(byId("vol").value), rate: Number(byId("rate").value), maturity: Number(byId("maturity").value), option_type: byId("type").value, strategy: byId("strategy").value, series: [] };
+    return { spot: Number(byId("spot").value), strike: Number(byId("strike").value), vol: Number(byId("vol").value), rate: Number(byId("rate").value), maturity: Number(byId("maturity").value), option_type: byId("type").value, strategy: byId("strategy").value, series: quoteSeries || [] };
   }
 
   async function runAnalysis(event) {
@@ -247,6 +281,36 @@
     greek = button.textContent.trim().toLowerCase();
     if (result) render(result);
   }));
+  document.querySelectorAll("[data-scenario]").forEach((button) => button.addEventListener("click", () => {
+    const scenario = { conservative: [0.16, 0.04], base: [0.25, 0.05], aggressive: [0.42, 0.06] }[button.dataset.scenario];
+    if (!scenario) return;
+    byId("vol").value = scenario[0];
+    byId("rate").value = scenario[1];
+    runAnalysis();
+  }));
+  byId("reset-btn").onclick = () => {
+    [["spot", 100], ["strike", 100], ["vol", 0.25], ["rate", 0.05], ["maturity", 1]].forEach(([id, value]) => { byId(id).value = value; });
+    quoteSeries = null;
+    runAnalysis();
+  };
+  byId("theme-btn").onclick = () => {
+    document.body.classList.toggle("light");
+    byId("theme-btn").querySelector("span").textContent = document.body.classList.contains("light") ? "Dark mode" : "Light mode";
+  };
+  byId("menu-btn").onclick = () => byId("sidebar").classList.toggle("open");
+  byId("copy-btn").onclick = async () => {
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(`Option price: INR ${number(result.modelPrice)} | IV: ${percent(result.impliedVol.marketIv)} | Delta: ${number(result.greeks.delta)}`);
+      byId("copy-btn").textContent = "Copied";
+    } catch (_) {
+      byId("copy-btn").textContent = "Copy unavailable";
+    }
+    window.setTimeout(() => { byId("copy-btn").textContent = "Copy summary"; }, 1300);
+  };
+  document.addEventListener("keydown", (event) => {
+    if (event.altKey && event.key.toLowerCase() === "p") { event.preventDefault(); runAnalysis(); }
+  });
   window.addEventListener("resize", () => result && render(result));
   runAnalysis();
 })();

@@ -45,9 +45,9 @@ NSE_LIST_HEADERS = {**YAHOO_HEADERS, "Referer": "https://www.nseindia.com/"}
 class DashboardRequest(BaseModel):
     spot: float = Field(gt=0)
     strike: float = Field(gt=0)
-    rate: float = Field(default=0.05, ge=0)
-    maturity: float = Field(default=1.0, gt=0)
-    vol: float = Field(default=0.2, gt=0)
+    rate: float = Field(default=0.05, ge=0, le=1)
+    maturity: float = Field(default=1.0, gt=0, le=30)
+    vol: float = Field(default=0.2, gt=0, le=10)
     option_type: Literal["call", "put"] = "call"
     series: list[dict] | None = None
 
@@ -515,6 +515,8 @@ def build_strategy_position(spot: float, strike: float, rate: float, maturity: f
             totals[name] += quantity * values[name]
         legs.append({
             "description": description,
+            "kind": leg["kind"],
+            "type": leg.get("type"),
             "quantity": quantity,
             "strike": round(leg.get("strike", 0.0), 2) if leg["kind"] == "option" else None,
             "price": round(values["price"], 4),
@@ -830,6 +832,7 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
             "payoff": build_strategy_payoff(payload.spot, position, payload.strategy),
             "strategyMetrics": strategy_metrics(position, payload.strike, payload.strategy),
             "strategyLegs": position["legs"],
+            "positionCost": round(position["cost"], 5),
             "strategy": payload.strategy,
             "requestMs": round((time.perf_counter() - started) * 1000, 3),
         }
