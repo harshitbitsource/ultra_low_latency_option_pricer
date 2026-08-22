@@ -1,5 +1,6 @@
 #include <cmath>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -33,7 +34,13 @@
 static double parse_double(const char* name, char** argv, int argc, double default_value) {
     for (int i = 1; i < argc - 1; ++i) {
         if (std::string(argv[i]) == name) {
-            return std::atof(argv[i + 1]);
+            char* end = nullptr;
+            errno = 0;
+            const double value = std::strtod(argv[i + 1], &end);
+            if (end == argv[i + 1] || *end != '\0' || errno == ERANGE) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return value;
         }
     }
     return default_value;
@@ -59,11 +66,12 @@ int main(int argc, char** argv) {
 
     if (!std::isfinite(spot) || !std::isfinite(strike) || !std::isfinite(rate) ||
         !std::isfinite(maturity) || !std::isfinite(vol) || spot <= 0.0 || strike <= 0.0 ||
-        maturity <= 0.0 || vol <= 0.0 || !std::isfinite(requested_iterations) ||
-        requested_iterations <= 0.0 || requested_iterations > std::numeric_limits<long long>::max() ||
+        maturity <= 0.0 || maturity > 30.0 || vol <= 0.0 || vol > 10.0 || rate < 0.0 || rate > 1.0 ||
+        !std::isfinite(requested_iterations) || requested_iterations <= 0.0 || requested_iterations > 1'000'000 ||
+        requested_iterations > std::numeric_limits<long long>::max() ||
         std::floor(requested_iterations) != requested_iterations || (type != "call" && type != "put")) {
-        std::cerr << "Invalid inputs: spot, strike, maturity and volatility must be positive; "
-                  << "iterations must be a positive integer; type must be call or put.\n";
+        std::cerr << "Invalid inputs: rate must be 0..1, maturity 0..30, volatility 0..10; "
+                  << "iterations must be an integer in 1..1000000; type must be call or put.\n";
         return EXIT_FAILURE;
     }
     const long long iterations = static_cast<long long>(requested_iterations);

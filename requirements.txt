@@ -1,4 +1,4 @@
-fastapi==0.109.1
-uvicorn==0.24.0
-ccxt
-nsepython
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+ccxt==4.5.70
+nsepython==2.97

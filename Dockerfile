@@ -8,8 +8,10 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --from=cpp-builder /usr/src/ultra_low_latency_option_pricer/cpp/option_pricer ./cpp/option_pricer
-COPY app.py ./
-COPY frontend ./frontend
+RUN useradd --create-home --uid 10001 appuser
+COPY --chown=appuser:appuser --from=cpp-builder /usr/src/ultra_low_latency_option_pricer/cpp/option_pricer ./cpp/option_pricer
+COPY --chown=appuser:appuser app.py ./
+COPY --chown=appuser:appuser frontend ./frontend
+USER appuser
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]

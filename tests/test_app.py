@@ -1,5 +1,5 @@
-import json
 import unittest
+from unittest.mock import patch
 from pydantic import ValidationError
 
 from app import (
@@ -9,9 +9,13 @@ from app import (
     build_strategy_payoff,
     build_strategy_position,
     build_volatility_summary,
+    calculate_gk_vol,
     api_analytics,
     parse_yahoo_chart_payload,
     strategy_metrics,
+    MAX_PRICER_ITERATIONS,
+    api_stock,
+    health_check,
 )
 
 
@@ -93,6 +97,14 @@ class TestDashboardHelpers(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     AnalyticsRequest(spot=100, strike=100, **values)
 
+    def test_garman_klass_requires_valid_ohlc_data(self):
+        self.assertEqual(calculate_gk_vol([{"close": 100}, {"close": None}]), 0.0)
+        vol = calculate_gk_vol([
+            {"ts": 0, "close": 100, "high": 101, "low": 99},
+            {"ts": 300, "close": 101, "high": 102, "low": 100},
+        ])
+        self.assertGreater(vol, 0.0)
+
 
 class TestYahooChartParser(unittest.TestCase):
     def test_parse_yahoo_chart_payload(self):
@@ -137,7 +149,10 @@ class TestYahooChartParser(unittest.TestCase):
         self.assertEqual(quote["prevClose"], 2460.0)
         self.assertAlmostEqual(quote["change"], -29.1, places=1)
         self.assertEqual(len(quote["series"]), 3)
-        self.assertEqual(quote["series"][0], {"ts": 1785383100, "close": 2475.5})
+        self.assertEqual(quote["series"][0], {
+            "ts": 1785383100, "close": 2475.5,
+            "open": 2436.199951171875, "high": 2481.10009765625, "low": 2436.199951171875,
+        })
 
     def test_parse_yahoo_chart_ignores_non_numeric_highs_and_lows(self):
         payload = {
@@ -148,6 +163,20 @@ class TestYahooChartParser(unittest.TestCase):
         quote = parse_yahoo_chart_payload(payload, "TEST.NS")
         self.assertEqual(quote["highPrice"], 102.0)
         self.assertEqual(quote["lowPrice"], 98.0)
+
+
+class TestApiSafety(unittest.TestCase):
+    def test_native_pricer_limit_is_consistent_with_public_configuration(self):
+        self.assertEqual(MAX_PRICER_ITERATIONS, 1_000_000)
+
+    def test_health_check_is_dependency_free(self):
+        self.assertEqual(health_check(), {"status": "ok"})
+
+    @patch("app.fetch_nse_stock_quote")
+    def test_stock_endpoint_does_not_expose_upstream_payload(self, fetch_quote):
+        fetch_quote.return_value = {"symbol": "TCS", "lastPrice": 100.0, "raw": {"secret": "provider-data"}}
+        response = api_stock(symbol="TCS")
+        self.assertNotIn("raw", response["quote"])
 
 
 if __name__ == "__main__":

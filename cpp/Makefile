@@ -1,5 +1,5 @@
 CXX := g++
-CXXFLAGS := -O3 -std=c++20 -march=native -ffast-math -Wall -Wextra -pedantic
+CXXFLAGS := -O3 -std=c++20 -Wall -Wextra -pedantic
 TARGET := option_pricer
 SRC := main.cpp
 

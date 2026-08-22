@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import ccxt
 import subprocess
@@ -40,6 +39,8 @@ YAHOO_HEADERS = {
 }
 NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 NSE_LIST_HEADERS = {**YAHOO_HEADERS, "Referer": "https://www.nseindia.com/"}
+MAX_SERIES_POINTS = 5_000
+MAX_PRICER_ITERATIONS = 1_000_000
 
 
 class DashboardRequest(BaseModel):
@@ -49,7 +50,9 @@ class DashboardRequest(BaseModel):
     maturity: float = Field(default=1.0, gt=0, le=30)
     vol: float = Field(default=0.2, gt=0, le=10)
     option_type: Literal["call", "put"] = "call"
-    series: list[dict] | None = None
+    # This data is supplied by the browser.  A bound prevents a large request
+    # from turning an analytics calculation into an avoidable memory/CPU spike.
+    series: list[dict] | None = Field(default=None, max_length=MAX_SERIES_POINTS)
 
 
 class AnalyticsRequest(DashboardRequest):
@@ -131,9 +134,16 @@ def parse_yahoo_chart_payload(payload: dict, symbol: str) -> dict:
     change = safe_float(last_price - prev_close) if last_price is not None and prev_close is not None else None
 
     series = []
-    for ts, close in zip(timestamps, closes):
+    for index, (ts, close) in enumerate(zip(timestamps, closes)):
         if close is not None:
-            series.append({"ts": int(ts), "close": safe_float(close)})
+            close_value = safe_float(close)
+            if close_value is not None:
+                series.append({
+                    "ts": int(ts), "close": close_value,
+                    "open": safe_float(opens[index]) if index < len(opens) else None,
+                    "high": safe_float(highs[index]) if index < len(highs) else None,
+                    "low": safe_float(lows[index]) if index < len(lows) else None,
+                })
 
     return {
         "symbol": symbol,
@@ -338,6 +348,28 @@ def _series_closes(series: list[dict] | None) -> list[float]:
     return closes
 
 
+def _annualization_factor(series: list[dict] | None) -> int:
+    """Estimate observations per year for timestamped intraday NSE bars.
+
+    Untimestamped data is treated as daily, which keeps the public helper
+    predictable for callers that provide ordinary end-of-day series.
+    """
+    if not isinstance(series, list):
+        return 252
+    timestamps = [safe_float(item.get("ts")) for item in series if isinstance(item, dict)]
+    timestamps = sorted(timestamp for timestamp in timestamps if timestamp is not None)
+    intervals = [later - earlier for earlier, later in zip(timestamps, timestamps[1:]) if later > earlier]
+    if not intervals:
+        return 252
+    interval_seconds = statistics.median(intervals)
+    if interval_seconds >= 24 * 60 * 60:
+        return 252
+    # NSE regular trading is 6.25 hours; cap the estimate so malformed or
+    # duplicate timestamps cannot generate extreme annualized volatility.
+    bars_per_session = min(390, max(1, round((6.25 * 60 * 60) / interval_seconds)))
+    return 252 * bars_per_session
+
+
 def calculate_realized_vol(series: list[dict] | None, annualization: int = 252) -> float:
     closes = _series_closes(series)
     if len(closes) < 2:
@@ -351,6 +383,7 @@ def calculate_realized_vol(series: list[dict] | None, annualization: int = 252) 
         returns.append(math.log(current / prev))
     if not returns:
         return 0.0
+    annualization = _annualization_factor(series) if annualization == 252 else annualization
     return round(statistics.pstdev(returns) * math.sqrt(annualization), 4)
 
 
@@ -358,6 +391,7 @@ def calculate_gk_vol(series: list[dict] | None) -> float:
     if not isinstance(series, list) or len(series) < 2:
         return 0.0
     total = 0.0
+    observations = 0
     for idx in range(1, len(series)):
         prev = series[idx - 1]
         current = series[idx]
@@ -365,14 +399,19 @@ def calculate_gk_vol(series: list[dict] | None) -> float:
             continue
         prev_close = safe_float(prev.get("close"))
         current_close = safe_float(current.get("close"))
-        high = safe_float(current.get("high")) or current_close * 1.01
-        low = safe_float(current.get("low")) or current_close * 0.99
         if prev_close is None or current_close is None or prev_close <= 0 or current_close <= 0:
+            continue
+        high = safe_float(current.get("high"))
+        low = safe_float(current.get("low"))
+        if high is None or low is None or high <= 0 or low <= 0 or high < low:
             continue
         log_hl = math.log(high / low)
         log_ret = math.log(current_close / prev_close)
         total += 0.5 * (log_hl * log_hl) - (2 * math.log(2) - 1) * (log_ret * log_ret)
-    return round(math.sqrt(max(total, 0.0) / max(len(series) - 1, 1)), 4)
+        observations += 1
+    if not observations:
+        return 0.0
+    return round(math.sqrt(max(total, 0.0) / observations) * math.sqrt(_annualization_factor(series)), 4)
 
 
 def build_volatility_summary(series: list[dict] | None, iv: float) -> dict:
@@ -661,9 +700,9 @@ def simulate_option_curve(
 def api_greeks(
     spot: float = Query(100.0, gt=0.0),
     strike: float = Query(100.0, gt=0.0),
-    rate: float = Query(0.05, ge=0.0),
-    maturity: float = Query(1.0, gt=0.0),
-    vol: float = Query(0.2, gt=0.0),
+    rate: float = Query(0.05, ge=0.0, le=1.0),
+    maturity: float = Query(1.0, gt=0.0, le=30.0),
+    vol: float = Query(0.2, gt=0.0, le=10.0),
     option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
 ) -> dict:
     try:
@@ -676,9 +715,9 @@ def api_greeks(
 def api_simulate(
     spot: float = Query(100.0, gt=0.0),
     strike: float = Query(100.0, gt=0.0),
-    rate: float = Query(0.05, ge=0.0),
-    maturity: float = Query(1.0, gt=0.0),
-    vol: float = Query(0.2, gt=0.0),
+    rate: float = Query(0.05, ge=0.0, le=1.0),
+    maturity: float = Query(1.0, gt=0.0, le=30.0),
+    vol: float = Query(0.2, gt=0.0, le=10.0),
     option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
     steps: int = Query(41, ge=5, le=201),
 ) -> dict:
@@ -721,7 +760,7 @@ def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
         high_price = safe_float(info.get("dayHigh") or info.get("highPrice") or info.get("high"))
         low_price = safe_float(info.get("dayLow") or info.get("lowPrice") or info.get("low"))
         prev_close = prev_close or safe_float(info.get("previousClose") or info.get("prevClose"))
-        change = change or safe_float(info.get("change") or info.get("pChange"))
+        change = change if change is not None else safe_float(info.get("change"))
 
     if "data" in payload and isinstance(payload["data"], dict):
         payload_data = payload["data"]
@@ -735,10 +774,12 @@ def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
         high_price = high_price or safe_float(payload_data.get("highPrice") or payload_data.get("high"))
         low_price = low_price or safe_float(payload_data.get("lowPrice") or payload_data.get("low"))
         prev_close = prev_close or safe_float(payload_data.get("priceprevclose") or payload_data.get("prevClose"))
-        change = change or safe_float(payload_data.get("pricechange") or payload_data.get("change"))
+        change = change if change is not None else safe_float(payload_data.get("pricechange") or payload_data.get("change"))
 
     if last_price is None:
         raise ValueError("Could not parse NSE quote payload")
+    if change is None and prev_close is not None:
+        change = last_price - prev_close
 
     return {
         "symbol": symbol,
@@ -783,6 +824,8 @@ def fetch_crypto_quote(symbol: str) -> dict:
     exchange = ccxt.binance({"enableRateLimit": True})
     ticker = exchange.fetch_ticker(symbol_value)
     last_price = safe_float(ticker.get("last") or ticker.get("close"))
+    if last_price is None:
+        raise ValueError("Crypto provider returned no last price")
     prev_close = safe_float(ticker.get("previousClose") or ticker.get("info", {}).get("previousClose"))
     change = safe_float(ticker.get("change"))
     if change is None and last_price is not None and prev_close is not None:
@@ -851,11 +894,11 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
 def api_price(
     spot: float = Query(100.0, gt=0.0),
     strike: float = Query(100.0, gt=0.0),
-    rate: float = Query(0.05, ge=0.0),
-    maturity: float = Query(1.0, gt=0.0),
-    vol: float = Query(0.2, gt=0.0),
+    rate: float = Query(0.05, ge=0.0, le=1.0),
+    maturity: float = Query(1.0, gt=0.0, le=30.0),
+    vol: float = Query(0.2, gt=0.0, le=10.0),
     option_type: str = Query("call", pattern="^(call|put)$", alias="type"),
-    iterations: int = Query(100000, ge=1),
+    iterations: int = Query(100000, ge=1, le=MAX_PRICER_ITERATIONS),
 ) -> dict:
     try:
         return run_pricer(spot, strike, rate, maturity, vol, option_type, iterations)
@@ -867,29 +910,30 @@ def api_price(
 
 @app.get("/api/stock")
 def api_stock(
-    symbol: str = Query(..., min_length=1),
+    symbol: str = Query(..., min_length=1, max_length=32),
     market: str = Query("equity", pattern="^(equity|crypto)$"),
 ) -> dict:
     symbol_value = symbol.strip().upper()
     if not symbol_value:
         raise HTTPException(status_code=400, detail="symbol query parameter is required")
     try:
-        if market == "crypto":
-            return {"symbol": symbol_value, "market": "crypto", "quote": fetch_crypto_quote(symbol_value)}
-        return {"symbol": symbol_value, "market": "equity", "quote": fetch_nse_stock_quote(symbol_value)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        quote = fetch_crypto_quote(symbol_value) if market == "crypto" else fetch_nse_stock_quote(symbol_value)
+        # Upstream payloads are large, inconsistent and may contain provider
+        # metadata that the browser never needs.  Return only the normalized API.
+        quote.pop("raw", None)
+        return {"symbol": symbol_value, "market": market, "quote": quote}
+    except Exception:
+        raise HTTPException(status_code=502, detail="Quote provider is temporarily unavailable")
+
+
+@app.get("/healthz")
+def health_check() -> dict:
+    """Liveness endpoint for container platforms and load balancers."""
+    return {"status": "ok"}
 
 
 if (FRONTEND_DIR / "index.html").exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-
-
-@app.get("/")
-def read_root() -> dict:
-    if (FRONTEND_DIR / "index.html").exists():
-        return FileResponse(FRONTEND_DIR / "index.html")
-    return {"message": "Ultra Low Latency Option Pricer backend is running."}
 
 
 if __name__ == "__main__":
