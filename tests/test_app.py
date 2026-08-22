@@ -1,21 +1,25 @@
 import unittest
 from unittest.mock import patch
+
 from pydantic import ValidationError
 
 from app import (
+    MAX_PRICER_ITERATIONS,
     AnalyticsRequest,
+    SingleFlightTTLCache,
+    api_analytics,
+    api_stock,
     black_scholes_price_and_greeks,
     build_dashboard_payload,
     build_strategy_payoff,
     build_strategy_position,
     build_volatility_summary,
     calculate_gk_vol,
-    api_analytics,
-    parse_yahoo_chart_payload,
-    strategy_metrics,
-    MAX_PRICER_ITERATIONS,
-    api_stock,
     health_check,
+    is_rate_limited,
+    parse_yahoo_chart_payload,
+    provider_call,
+    strategy_metrics,
 )
 
 
@@ -170,7 +174,40 @@ class TestApiSafety(unittest.TestCase):
         self.assertEqual(MAX_PRICER_ITERATIONS, 1_000_000)
 
     def test_health_check_is_dependency_free(self):
-        self.assertEqual(health_check(), {"status": "ok"})
+        self.assertEqual(health_check(), {"status": "ok", "service": "quantsight"})
+
+    def test_provider_call_retries_transient_failure(self):
+        attempts = []
+
+        def operation():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("temporary")
+            return "ok"
+
+        with patch("app.time.sleep"):
+            self.assertEqual(provider_call("test", operation), "ok")
+        self.assertEqual(len(attempts), 2)
+
+    def test_ttl_cache_avoids_duplicate_loader_calls(self):
+        cache = SingleFlightTTLCache()
+        calls = []
+
+        def load():
+            calls.append(1)
+            return {"value": 1}
+
+        self.assertEqual(cache.get_or_load("key", 60, load), {"value": 1})
+        self.assertEqual(cache.get_or_load("key", 60, load), {"value": 1})
+        self.assertEqual(len(calls), 1)
+
+    def test_rate_limit_returns_429(self):
+        import app as application
+
+        application._request_buckets.clear()
+        with patch("app.RATE_LIMIT_REQUESTS", 1):
+            self.assertFalse(is_rate_limited("127.0.0.1"))
+            self.assertTrue(is_rate_limited("127.0.0.1"))
 
     @patch("app.fetch_nse_stock_quote")
     def test_stock_endpoint_does_not_expose_upstream_payload(self, fetch_quote):

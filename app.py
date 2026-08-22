@@ -1,23 +1,32 @@
-import json
 import csv
 import io
+import json
+import logging
 import math
+import os
 import random
+import re
 import statistics
-import time
-from pathlib import Path
-from typing import Literal
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
-from functools import lru_cache
-from urllib.request import Request, urlopen
-
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
-from fastapi.staticfiles import StaticFiles
-import ccxt
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Literal, TypeVar
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, quote_plus
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
+
+import ccxt
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from nsepython import nse_eq, nse_eq_symbols, nse_quote, nsesymbolpurify
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
 CPP_DIR = ROOT / "cpp"
@@ -30,6 +39,7 @@ app = FastAPI(
     version="1.0",
 )
 
+
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search?q={query}&lang=en-IN"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=5m"
 YAHOO_HEADERS = {
@@ -41,6 +51,151 @@ NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_
 NSE_LIST_HEADERS = {**YAHOO_HEADERS, "Referer": "https://www.nseindia.com/"}
 MAX_SERIES_POINTS = 5_000
 MAX_PRICER_ITERATIONS = 1_000_000
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "262144"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "6"))
+PROVIDER_RETRIES = int(os.getenv("PROVIDER_RETRIES", "2"))
+PROVIDER_CONCURRENCY = int(os.getenv("PROVIDER_CONCURRENCY", "8"))
+ALLOWED_ORIGINS = tuple(origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip())
+
+logger = logging.getLogger("quantsight")
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(message)s")
+
+
+def log_event(event: str, **fields: Any) -> None:
+    """Emit JSON logs without serializing request payloads or provider responses."""
+    logger.info(json.dumps({"event": event, **fields}, default=str, separators=(",", ":")))
+
+
+class ProviderError(RuntimeError):
+    """Safe, provider-agnostic error exposed to API clients as a 502."""
+
+
+T = TypeVar("T")
+
+
+class SingleFlightTTLCache:
+    """Small thread-safe TTL cache that coalesces concurrent cache misses."""
+
+    def __init__(self, max_entries: int = 512):
+        self._values: dict[str, tuple[float, Any]] = {}
+        self._inflight: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
+        self._max_entries = max_entries
+
+    def get_or_load(self, key: str, ttl_seconds: float, loader: Callable[[], T]) -> T:
+        while True:
+            with self._lock:
+                cached = self._values.get(key)
+                if cached and cached[0] > time.monotonic():
+                    return cached[1]
+                event = self._inflight.get(key)
+                if event is None:
+                    event = threading.Event()
+                    self._inflight[key] = event
+                    break
+            event.wait(timeout=PROVIDER_TIMEOUT_SECONDS * (PROVIDER_RETRIES + 1) + 1)
+        try:
+            value = loader()
+            with self._lock:
+                if len(self._values) >= self._max_entries:
+                    self._values.pop(next(iter(self._values)))
+                self._values[key] = (time.monotonic() + ttl_seconds, value)
+            return value
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+                event.set()
+
+
+provider_cache = SingleFlightTTLCache()
+provider_executor = ThreadPoolExecutor(max_workers=PROVIDER_CONCURRENCY, thread_name_prefix="market-data")
+provider_semaphore = threading.BoundedSemaphore(PROVIDER_CONCURRENCY)
+
+
+def provider_call(name: str, operation: Callable[[], T]) -> T:
+    """Run a bounded provider call with retry/backoff and safe failure semantics."""
+    if not provider_semaphore.acquire(timeout=PROVIDER_TIMEOUT_SECONDS):
+        raise ProviderError("Market-data service is busy; please retry shortly")
+    try:
+        last_error: Exception | None = None
+        for attempt in range(PROVIDER_RETRIES + 1):
+            future = provider_executor.submit(operation)
+            try:
+                return future.result(timeout=PROVIDER_TIMEOUT_SECONDS)
+            except FuturesTimeoutError as exc:
+                future.cancel()
+                last_error = exc
+            except Exception as exc:  # Provider libraries use many exception types.
+                last_error = exc
+            if attempt < PROVIDER_RETRIES:
+                time.sleep(0.15 * (2 ** attempt))
+        log_event("provider_failure", provider=name, error_type=type(last_error).__name__ if last_error else "unknown")
+        raise ProviderError("Market-data provider is temporarily unavailable") from last_error
+    finally:
+        provider_semaphore.release()
+
+
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(ALLOWED_ORIGINS),
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+        max_age=600,
+    )
+
+_request_buckets: dict[str, tuple[float, int]] = {}
+_request_bucket_lock = threading.Lock()
+
+
+def is_rate_limited(client: str) -> bool:
+    """Fixed-window limiter for public APIs; state is local to one application instance."""
+    now = time.monotonic()
+    with _request_bucket_lock:
+        window_start, count = _request_buckets.get(client, (now, 0))
+        if now - window_start >= RATE_LIMIT_WINDOW_SECONDS:
+            window_start, count = now, 0
+        count += 1
+        _request_buckets[client] = (window_start, count)
+        if len(_request_buckets) > 10_000:
+            _request_buckets.clear()
+        return count > RATE_LIMIT_REQUESTS
+
+
+@app.middleware("http")
+async def production_guardrails(request: Request, call_next):
+    """Apply request limits, per-client rate limits, security headers and JSON logs."""
+    started = time.perf_counter()
+    path = request.url.path
+    if request.method in {"POST", "PUT", "PATCH"}:
+        content_length = request.headers.get("content-length")
+        if content_length and (not content_length.isdigit() or int(content_length) > MAX_REQUEST_BYTES):
+            return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+    if path.startswith("/api/"):
+        client = request.client.host if request.client else "unknown"
+        if is_rate_limited(client):
+            response = JSONResponse(status_code=429, content={"detail": "Rate limit exceeded; retry shortly"})
+            response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
+            return response
+    try:
+        response = await call_next(request)
+    except Exception:
+        log_event("request_failure", method=request.method, path=path)
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    response.headers.update({
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+        "Cache-Control": "no-store" if path.startswith("/api/") else "public, max-age=300",
+    })
+    log_event("request", method=request.method, path=path, status=response.status_code,
+              duration_ms=round((time.perf_counter() - started) * 1000, 2))
+    return response
 
 
 class DashboardRequest(BaseModel):
@@ -60,15 +215,22 @@ class AnalyticsRequest(DashboardRequest):
     strategy: Literal["long_call", "long_put", "short_call", "short_put", "straddle", "collar"] = "long_call"
 
 
-def load_url(url: str, headers: dict | None = None) -> bytes:
-    request = Request(url, headers=headers or YAHOO_HEADERS)
+def _load_url_once(url: str, headers: dict | None = None) -> bytes:
+    request = UrlRequest(url, headers=headers or YAHOO_HEADERS)
     try:
-        with urlopen(request, timeout=20) as response:
-            return response.read()
+        with urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+            payload = response.read(5 * 1024 * 1024 + 1)
+            if len(payload) > 5 * 1024 * 1024:
+                raise ValueError("Provider response is too large")
+            return payload
     except HTTPError as exc:
-        raise ValueError(f"Yahoo API failed: {exc.code} {exc.reason}")
+        raise ValueError(f"HTTP {exc.code}") from exc
     except URLError as exc:
-        raise ValueError(f"Yahoo API failed: {exc.reason}")
+        raise ValueError("Network error") from exc
+
+
+def load_url(url: str, headers: dict | None = None) -> bytes:
+    return provider_call("http", lambda: _load_url_once(url, headers))
 
 
 def load_json_url(url: str) -> dict:
@@ -166,11 +328,11 @@ def fetch_yahoo_equity_quote(symbol: str) -> dict:
         # and TCS). Searching first incorrectly rejects valid short symbols.
         direct_symbol = build_yahoo_symbol(symbol_value)
         try:
-            payload = load_json_url(YAHOO_CHART_URL.format(symbol=direct_symbol))
+            payload = load_json_url(YAHOO_CHART_URL.format(symbol=quote(direct_symbol, safe=".")))
             return parse_yahoo_chart_payload(payload, direct_symbol)
         except ValueError:
             symbol_value = search_yahoo_equity_symbol(symbol_value)
-    payload = load_json_url(YAHOO_CHART_URL.format(symbol=symbol_value))
+    payload = load_json_url(YAHOO_CHART_URL.format(symbol=quote(symbol_value, safe=".")))
     return parse_yahoo_chart_payload(payload, symbol_value)
 
 
@@ -229,6 +391,7 @@ def run_pricer(
         capture_output=True,
         text=True,
         check=True,
+        timeout=10,
     )
     return parse_engine_output(result.stdout)
 
@@ -241,40 +404,47 @@ def safe_float(value, default=None):
         return default
 
 
-@lru_cache(maxsize=1)
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def get_nse_equities() -> list[dict]:
     """Return the official NSE equity master list, with a library fallback."""
-    try:
-        text = load_url(NSE_EQUITY_LIST_URL, NSE_LIST_HEADERS).decode("utf-8-sig")
-        rows = csv.DictReader(io.StringIO(text))
-        equities = [
-            {"symbol": row["SYMBOL"].strip(), "name": row.get("NAME OF COMPANY", "").strip(),
-             "series": row.get(" SERIES", row.get("SERIES", "")).strip()}
-            for row in rows if row.get("SYMBOL", "").strip()
-        ]
-        if equities:
-            return sorted(equities, key=lambda item: item["symbol"])
-    except Exception:
-        pass
-    try:
-        return [{"symbol": symbol, "name": "", "series": "EQ"} for symbol in sorted(nse_eq_symbols())]
-    except Exception:
-        return []
+    def load() -> list[dict]:
+        try:
+            text = load_url(NSE_EQUITY_LIST_URL, NSE_LIST_HEADERS).decode("utf-8-sig")
+            rows = csv.DictReader(io.StringIO(text))
+            equities = [
+                {"symbol": row["SYMBOL"].strip(), "name": row.get("NAME OF COMPANY", "").strip(),
+                 "series": row.get(" SERIES", row.get("SERIES", "")).strip()}
+                for row in rows if row.get("SYMBOL", "").strip()
+            ]
+            if equities:
+                return sorted(equities, key=lambda item: item["symbol"])
+        except Exception:
+            log_event("provider_fallback", provider="nse_equity_list")
+        try:
+            return provider_call("nse", lambda: [
+                {"symbol": symbol, "name": "", "series": "EQ"} for symbol in sorted(nse_eq_symbols())
+            ])
+        except ProviderError:
+            return []
+    return provider_cache.get_or_load("nse-equities", 3600, load)
 
 
-@lru_cache(maxsize=1)
 def get_crypto_symbol_list() -> list[str]:
-    try:
-        exchange = ccxt.binance({"enableRateLimit": True})
-        markets = exchange.load_markets()
-        symbols = sorted([symbol for symbol in markets.keys() if symbol.endswith("/USDT")])
-        return symbols
-    except Exception:
-        return []
+    def load() -> list[str]:
+        try:
+            exchange = ccxt.binance({"enableRateLimit": True, "timeout": int(PROVIDER_TIMEOUT_SECONDS * 1000)})
+            markets = provider_call("binance", exchange.load_markets)
+            return sorted(symbol for symbol in markets if symbol.endswith("/USDT"))
+        except ProviderError:
+            return []
+    return provider_cache.get_or_load("crypto-symbols", 3600, load)
 
 
 @app.get("/api/nse-symbols")
-def api_nse_symbols(q: str = Query("", alias="q")) -> dict:
+def api_nse_symbols(q: str = Query("", alias="q", max_length=32)) -> dict:
     equities = get_nse_equities()
     query = q.strip().upper()
     if query:
@@ -287,7 +457,7 @@ def api_nse_symbols(q: str = Query("", alias="q")) -> dict:
 
 
 @app.get("/api/crypto-symbols")
-def api_crypto_symbols(q: str = Query("", alias="q")) -> dict:
+def api_crypto_symbols(q: str = Query("", alias="q", max_length=32)) -> dict:
     symbols = get_crypto_symbol_list()
     if q:
         query = q.strip().upper()
@@ -646,17 +816,20 @@ def build_dashboard_payload(
 ) -> dict:
     bs = black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
     binomial = binomial_tree_price(spot, strike, rate, maturity, vol, option_type)
-    market_price = bs["price"] * (1 + 0.04 * (1 - min(abs(spot - strike) / max(spot, 1.0), 0.8)))
-    market_iv = solve_implied_volatility(market_price, spot, strike, rate, maturity, option_type)
+    # There is no licensed option-chain feed in this deployment.  These values
+    # are intentionally model-derived scenario estimates, never market quotes.
+    estimated_price = bs["price"] * (1 + 0.04 * (1 - min(abs(spot - strike) / max(spot, 1.0), 0.8)))
+    estimated_iv = solve_implied_volatility(estimated_price, spot, strike, rate, maturity, option_type)
     volatility = build_volatility_summary(series, vol)
     model_start = time.perf_counter()
     mc = monte_carlo_price(spot, strike, rate, maturity, vol, option_type)
     analytics_ms = round((time.perf_counter() - model_start) * 1000, 3)
     return {
         "modelPrice": round(bs["price"], 4),
-        "marketPrice": round(market_price, 4),
+        "marketPrice": round(estimated_price, 4),  # Backwards-compatible alias; see marketData metadata.
+        "estimatedPrice": round(estimated_price, 4),
         "binomialPrice": binomial,
-        "priceDifference": round(market_price - bs["price"], 4),
+        "priceDifference": round(estimated_price - bs["price"], 4),
         "models": {
             "blackScholes": round(bs["price"], 4),
             "binomialAmerican": binomial,
@@ -667,11 +840,20 @@ def build_dashboard_payload(
         "volatility": volatility,
         "impliedVol": {
             "modelIv": round(vol, 4),
-            "marketIv": market_iv,
-            "gap": round(market_iv - vol, 4),
-            "signal": "rich" if market_iv > vol else "cheap",
+            "marketIv": estimated_iv,  # Backwards-compatible alias; not a live IV.
+            "estimatedIv": estimated_iv,
+            "gap": round(estimated_iv - vol, 4),
+            "signal": "rich" if estimated_iv > vol else "cheap",
+            "source": "model-derived estimate",
+            "dataStatus": "estimated",
         },
-        "note": "Market price/IV is an estimate unless a live option-chain provider is connected; it is not an NSE quote.",
+        "marketData": {
+            "source": "No licensed option-chain provider configured",
+            "dataStatus": "estimated",
+            "asOf": utc_now(),
+            "message": "Option price and implied volatility are model-derived estimates, not exchange quotes.",
+        },
+        "note": "Option price and IV are estimates; no live option-chain data is configured.",
     }
 
 
@@ -684,7 +866,6 @@ def simulate_option_curve(
     option_type: str,
     steps: int = 41,
 ) -> dict:
-    center = spot
     low = max(1.0, spot * 0.5)
     high = spot * 1.5
     step = max(1.0, (high - low) / max(steps - 1, 1))
@@ -708,7 +889,8 @@ def api_greeks(
     try:
         return black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        log_event("calculation_failure", endpoint="greeks", error_type=type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Invalid pricing inputs") from exc
 
 
 @app.get("/api/simulate")
@@ -724,7 +906,8 @@ def api_simulate(
     try:
         return simulate_option_curve(spot, strike, rate, maturity, vol, option_type, steps)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        log_event("calculation_failure", endpoint="simulate", error_type=type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Invalid simulation inputs") from exc
 
 
 def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
@@ -795,25 +978,27 @@ def parse_stock_quote_payload(payload: dict, symbol: str) -> dict:
 
 def fetch_nse_stock_quote(symbol: str) -> dict:
     symbol_value = nsesymbolpurify(symbol.strip().upper())
-    errors = []
-    for fetch_fn in (nse_quote, nse_eq):
-        try:
-            payload = fetch_fn(symbol_value)
-            if payload and isinstance(payload, dict):
-                try:
-                    return parse_stock_quote_payload(payload, symbol_value)
-                except ValueError as exc:
-                    errors.append(exc)
-        except Exception as exc:
-            errors.append(exc)
+    if not symbol_value or len(symbol_value) > 32:
+        raise ValueError("Invalid equity symbol")
 
-    try:
-        return fetch_yahoo_equity_quote(symbol_value)
-    except Exception as exc:
-        errors.append(exc)
-        raise ValueError(
-            f"Could not fetch NSE quote for {symbol_value}; errors: {errors}"
-        )
+    def load() -> dict:
+        for fetch_fn in (nse_quote, nse_eq):
+            try:
+                payload = provider_call("nse", lambda fn=fetch_fn: fn(symbol_value))
+                if payload and isinstance(payload, dict):
+                    quote = parse_stock_quote_payload(payload, symbol_value)
+                    quote.update({"source": "NSE via NSEPython", "dataStatus": "provider", "asOf": utc_now()})
+                    return quote
+            except (ProviderError, ValueError):
+                continue
+        try:
+            quote = fetch_yahoo_equity_quote(symbol_value)
+            quote.update({"source": "Yahoo Finance", "dataStatus": "provider", "asOf": utc_now()})
+            return quote
+        except Exception as exc:
+            raise ProviderError("Equity quote is temporarily unavailable") from exc
+
+    return provider_cache.get_or_load(f"equity:{symbol_value}", 15, load)
 
 
 def fetch_crypto_quote(symbol: str) -> dict:
@@ -821,25 +1006,32 @@ def fetch_crypto_quote(symbol: str) -> dict:
     if "/" not in symbol_value:
         symbol_value = f"{symbol_value}/USDT"
 
-    exchange = ccxt.binance({"enableRateLimit": True})
-    ticker = exchange.fetch_ticker(symbol_value)
-    last_price = safe_float(ticker.get("last") or ticker.get("close"))
-    if last_price is None:
-        raise ValueError("Crypto provider returned no last price")
-    prev_close = safe_float(ticker.get("previousClose") or ticker.get("info", {}).get("previousClose"))
-    change = safe_float(ticker.get("change"))
-    if change is None and last_price is not None and prev_close is not None:
-        change = last_price - prev_close
-    return {
-        "symbol": symbol_value,
-        "lastPrice": last_price,
-        "openPrice": safe_float(ticker.get("open")),
-        "highPrice": safe_float(ticker.get("high")),
-        "lowPrice": safe_float(ticker.get("low")),
-        "prevClose": prev_close,
-        "change": change,
-        "raw": ticker,
-    }
+    if len(symbol_value) > 32 or not all(char.isalnum() or char in "/-" for char in symbol_value):
+        raise ValueError("Invalid crypto symbol")
+
+    def load() -> dict:
+        exchange = ccxt.binance({"enableRateLimit": True, "timeout": int(PROVIDER_TIMEOUT_SECONDS * 1000)})
+        ticker = provider_call("binance", lambda: exchange.fetch_ticker(symbol_value))
+        last_price = safe_float(ticker.get("last") or ticker.get("close"))
+        if last_price is None:
+            raise ProviderError("Crypto provider returned no last price")
+        prev_close = safe_float(ticker.get("previousClose") or ticker.get("info", {}).get("previousClose"))
+        change = safe_float(ticker.get("change"))
+        if change is None and prev_close is not None:
+            change = last_price - prev_close
+        return {
+            "symbol": symbol_value,
+            "lastPrice": last_price,
+            "openPrice": safe_float(ticker.get("open")),
+            "highPrice": safe_float(ticker.get("high")),
+            "lowPrice": safe_float(ticker.get("low")),
+            "prevClose": prev_close,
+            "change": change,
+            "source": "Binance via CCXT",
+            "dataStatus": "provider",
+            "asOf": utc_now(),
+        }
+    return provider_cache.get_or_load(f"crypto:{symbol_value}", 10, load)
 
 
 @app.post("/api/dashboard")
@@ -855,7 +1047,8 @@ def api_dashboard(payload: DashboardRequest) -> dict:
             payload.series,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        log_event("calculation_failure", endpoint="dashboard", error_type=type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Invalid dashboard inputs") from exc
 
 
 @app.post("/api/analytics")
@@ -887,7 +1080,8 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
             "requestMs": round((time.perf_counter() - started) * 1000, 3),
         }
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        log_event("calculation_failure", endpoint="analytics", error_type=type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Invalid analytics inputs") from exc
 
 
 @app.get("/api/price")
@@ -903,9 +1097,11 @@ def api_price(
     try:
         return run_pricer(spot, strike, rate, maturity, vol, option_type, iterations)
     except subprocess.CalledProcessError as exc:
-        raise HTTPException(status_code=500, detail=exc.stderr or "Pricing engine failed")
+        log_event("pricing_engine_failure", error_type=type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Pricing engine is temporarily unavailable") from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        log_event("pricing_engine_failure", error_type=type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Pricing engine is temporarily unavailable") from exc
 
 
 @app.get("/api/stock")
@@ -914,22 +1110,29 @@ def api_stock(
     market: str = Query("equity", pattern="^(equity|crypto)$"),
 ) -> dict:
     symbol_value = symbol.strip().upper()
-    if not symbol_value:
-        raise HTTPException(status_code=400, detail="symbol query parameter is required")
+    if not symbol_value or not re.fullmatch(r"[A-Z0-9&./-]+", symbol_value):
+        raise HTTPException(status_code=400, detail="Invalid symbol")
     try:
         quote = fetch_crypto_quote(symbol_value) if market == "crypto" else fetch_nse_stock_quote(symbol_value)
         # Upstream payloads are large, inconsistent and may contain provider
         # metadata that the browser never needs.  Return only the normalized API.
         quote.pop("raw", None)
         return {"symbol": symbol_value, "market": market, "quote": quote}
-    except Exception:
+    except Exception as exc:
+        log_event("quote_failure", market=market, error_type=type(exc).__name__)
         raise HTTPException(status_code=502, detail="Quote provider is temporarily unavailable")
 
 
-@app.get("/healthz")
+@app.get("/health")
 def health_check() -> dict:
     """Liveness endpoint for container platforms and load balancers."""
-    return {"status": "ok"}
+    return {"status": "ok", "service": "quantsight"}
+
+
+@app.get("/ready")
+def readiness_check() -> dict:
+    """Readiness is local-only: external providers are intentionally not probed."""
+    return {"status": "ready", "pricingEnginePresent": BINARY_PATH.exists()}
 
 
 if (FRONTEND_DIR / "index.html").exists():

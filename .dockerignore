@@ -1,8 +1,7 @@
 .git
+.github
 .venv
 __pycache__
+tests
 *.pyc
-*.pyo
-*.pyd
-*.swp
-.DS_Store
+cpp/option_pricer

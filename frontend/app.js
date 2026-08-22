@@ -11,7 +11,23 @@
   let suggestionTimer;
   let suggestionRequest;
   let analyticsRequest;
+  let quoteRequest;
   let analyticsRevision = 0;
+  let quoteRevision = 0;
+
+  function drawUnavailable(id, message) {
+    const element = byId(id);
+    const context = element?.getContext?.("2d");
+    if (!context) return;
+    const width = Math.max(element.clientWidth || 0, 260);
+    const height = Number(element.getAttribute("height") || 210);
+    const scale = window.devicePixelRatio || 1;
+    element.width = width * scale; element.height = height * scale;
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    context.fillStyle = "#0b1728"; context.fillRect(0, 0, width, height);
+    context.fillStyle = "#91a2bb"; context.font = "12px system-ui";
+    context.textAlign = "center"; context.fillText(message, width / 2, height / 2);
+  }
 
   function drawChart(id, rows, key, colour, { zero = false, overlay } = {}) {
     const element = byId(id);
@@ -55,45 +71,26 @@
     if (overlay?.length) line(overlay, "#47d7a1");
   }
 
-  function volatilityRows(data) {
-    const iv = data.impliedVol.marketIv;
-    const rv = data.volatility.realizedVol || data.impliedVol.modelIv;
-    return Array.from({ length: 24 }, (_, index) => ({
-      iv: iv * (0.94 + Math.sin(index / 3) * 0.04),
-      rv: rv * (0.92 + Math.cos(index / 4) * 0.06),
-    }));
-  }
-
   function simulatedSurface(data) {
     const supplied = Array.isArray(data.surface) ? data.surface.filter(Boolean) : [];
-    if (supplied.length) return supplied;
-    const spot = Number(data.spot || byId("spot")?.value || 100);
-    return [7, 30, 60].flatMap((dte) => [-0.15, -0.075, 0, 0.075, 0.15].map((move) => ({
-      dte, strike: spot * (1 + move), delta: 0.5 - move * 2, gamma: 0.02, vega: 0.1, theta: -0.03,
-    })));
-  }
-
-  function simulatedQuote(data) {
-    const spot = Number(byId("spot")?.value || data.spot || 100);
-    return Array.from({ length: 48 }, (_, index) => ({
-      close: spot * (1 + 0.012 * Math.sin(index / 4) + 0.004 * Math.cos(index / 2)),
-    }));
+    return supplied;
   }
 
   function renderCharts(data, surface, payoff) {
     // Wait for layout before sizing canvases, then redraw after a responsive reflow.
     requestAnimationFrame(() => requestAnimationFrame(() => {
       if (result !== data) return;
-      try { drawChart("quote-chart", quoteSeries || simulatedQuote(data), "close", "#47d7a1"); } catch (error) { console.error("Quote chart failed", error); }
+      try {
+        if (quoteSeries?.length) drawChart("quote-chart", quoteSeries, "close", "#47d7a1");
+        else drawUnavailable("quote-chart", "No provider price history loaded");
+      } catch (error) { console.error("Quote chart failed", error); }
       try { drawChart("payoff-chart", payoff, "pnl", "#73a7ff", { zero: true }); } catch (error) { console.error("Payoff chart failed", error); }
       try {
         const greekRows = surface.filter((row) => Number(row.dte) === 30).map((row) => ({ value: Number(row[greek]) }));
-        drawChart("greek-chart", greekRows, "value", "#b28cff", { zero: greek === "theta" });
+        if (greekRows.length) drawChart("greek-chart", greekRows, "value", "#b28cff", { zero: greek === "theta" });
+        else drawUnavailable("greek-chart", "No sensitivity data available");
       } catch (error) { console.error("Greek chart failed", error); }
-      try {
-        const rows = volatilityRows(data);
-        drawChart("vol-chart", rows, "iv", "#b28cff", { overlay: rows.map(({ rv }) => ({ iv: rv })) });
-      } catch (error) { console.error("Volatility chart failed", error); }
+      drawUnavailable("vol-chart", "Historical IV series is unavailable without an option-chain provider");
     }));
   }
 
@@ -156,14 +153,14 @@
     byId("m-iv").textContent = percent(data.impliedVol.marketIv);
     byId("m-rv").textContent = percent(data.volatility.realizedVol);
     byId("m-latency").textContent = `${number(data.requestMs)} ms`;
-    byId("m-signal").textContent = `${data.impliedVol.signal} IV signal`;
+    byId("m-signal").textContent = `${data.impliedVol.signal} estimate signal`;
     byId("request-time").textContent = `${number(data.requestMs)} ms`;
     byId("vol-regime").textContent = data.volatility.regime;
     byId("vol-regime").className = `pill ${data.volatility.regime}`;
     byId("vol-info").innerHTML = [["Garman–Klass", percent(data.volatility.gkVol)], ["30d forecast", percent(data.volatility.forward30d)], ["IV / RV", `${number(data.volatility.ivVsRealized)}×`]].map(([label, value]) => `<span>${label} <b>${value}</b></span>`).join("");
     const models = [["blue", "Black–Scholes", "European benchmark", data.models.blackScholes], ["purple", "Binomial tree", "American exercise", data.models.binomialAmerican], ["green", "Monte Carlo", "Antithetic variates", data.models.monteCarloAntithetic]];
     byId("models").innerHTML = models.map(([colour, name, description, price], index) => `<div class="model-row ${index === 0 ? "featured" : ""}"><span class="model-dot ${colour}"></span><div><b>${name}</b><small>${description}</small></div><strong>₹ ${number(price)}</strong></div>`).join("");
-    byId("model-note").textContent = `Binomial premium: ₹ ${number(data.models.binomialAmerican - data.models.blackScholes)} · Market-model gap: ₹ ${number(data.priceDifference)}`;
+    byId("model-note").textContent = `${data.marketData?.message || "Model-derived values only."} Binomial premium: ₹ ${number(data.models.binomialAmerican - data.models.blackScholes)}.`;
     byId("greek-cards").innerHTML = Object.entries(data.greeks).map(([name, value]) => `<article><small>${name}</small><strong>${number(value)}</strong><span>${name === "theta" ? "annual time decay" : name === "vega" ? "volatility sensitivity" : "current exposure"}</span></article>`).join("");
     const title = greek[0].toUpperCase() + greek.slice(1);
     byId("surface-title").textContent = `${title} surface`;
@@ -202,7 +199,7 @@
         body: JSON.stringify(requestData()),
         signal: analyticsRequest.signal,
       });
-      const payload = await response.json();
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail || "Analytics request failed");
       if (revision === analyticsRevision) render(payload);
     } catch (error) {
@@ -219,12 +216,16 @@
     const symbol = byId("symbol").value.trim();
     if (!symbol) return;
     const button = byId("quote-btn");
+    quoteRequest?.abort();
+    quoteRequest = new AbortController();
+    const revision = ++quoteRevision;
     button.disabled = true;
     button.textContent = "Loading…";
     try {
-      const response = await fetch(`/api/stock?market=equity&symbol=${encodeURIComponent(symbol)}`);
-      const payload = await response.json();
+      const response = await fetch(`/api/stock?market=equity&symbol=${encodeURIComponent(symbol)}`, { signal: quoteRequest.signal });
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail || "Quote unavailable");
+      if (revision !== quoteRevision) return;
       const quote = payload.quote;
       quoteSeries = Array.isArray(quote.series) && quote.series.length ? quote.series : null;
       byId("spot").value = quote.lastPrice;
@@ -232,13 +233,24 @@
       byId("quote-last").textContent = `₹ ${number(quote.lastPrice)}`;
       byId("quote-change").textContent = quote.change == null ? "Quote loaded" : `${quote.change >= 0 ? "▲" : "▼"} ${number(quote.change)}`;
       byId("quote-stats").innerHTML = [["Open", quote.openPrice], ["High", quote.highPrice], ["Low", quote.lowPrice]].map(([label, value]) => `<span>${label} <b>₹ ${number(value)}</b></span>`).join("");
-      requestAnimationFrame(() => drawChart("quote-chart", quoteSeries || simulatedQuote({}), "close", quote.change >= 0 ? "#47d7a1" : "#fb7185"));
+      byId("quote-status").textContent = "Provider quote";
+      byId("quote-source").textContent = `${quote.source || "Provider"} · retrieved ${quote.asOf || "just now"}. Provider data may be delayed.`;
+      requestAnimationFrame(() => {
+        if (quoteSeries?.length) drawChart("quote-chart", quoteSeries, "close", quote.change >= 0 ? "#47d7a1" : "#fb7185");
+        else drawUnavailable("quote-chart", "Provider did not return price history");
+      });
       runAnalysis();
     } catch (error) {
-      byId("quote-change").textContent = error.message;
+      if (error.name !== "AbortError" && revision === quoteRevision) {
+        byId("quote-change").textContent = error.message || "Quote unavailable. Please retry.";
+        byId("quote-status").textContent = "Quote unavailable";
+        byId("quote-source").textContent = "No provider data was loaded; existing pricing inputs were preserved.";
+      }
     } finally {
-      button.disabled = false;
-      button.textContent = "Fetch quote";
+      if (revision === quoteRevision) {
+        button.disabled = false;
+        button.textContent = "Fetch quote";
+      }
     }
   }
 
