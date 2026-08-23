@@ -26,6 +26,10 @@ cd /home/harshit/Documents/ultra_low_latency_option_pricer
 
 Open `http://127.0.0.1:8000` in your browser.
 
+Running `./.venv/bin/python app.py` directly binds to `127.0.0.1` (loopback) by
+default. To serve on the local network on purpose, set `HOST=0.0.0.0` (and
+optionally `PORT`). The Docker image already binds `0.0.0.0` for container use.
+
 ## Notes
 
 - NSE equity quotes depend on NSEPython and are subject to NSE access restrictions.

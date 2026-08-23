@@ -56,6 +56,10 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "6"))
 PROVIDER_RETRIES = int(os.getenv("PROVIDER_RETRIES", "2"))
+# Keep the network-level timeout strictly below the per-call budget so the
+# underlying socket raises (a fast, catchable failure) before provider_call
+# abandons the worker thread, which would otherwise leak an executor slot.
+PROVIDER_NETWORK_TIMEOUT_SECONDS = max(1.0, PROVIDER_TIMEOUT_SECONDS - 0.5)
 PROVIDER_CONCURRENCY = int(os.getenv("PROVIDER_CONCURRENCY", "8"))
 ALLOWED_ORIGINS = tuple(origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip())
 
@@ -116,22 +120,36 @@ provider_semaphore = threading.BoundedSemaphore(PROVIDER_CONCURRENCY)
 
 
 def provider_call(name: str, operation: Callable[[], T]) -> T:
-    """Run a bounded provider call with retry/backoff and safe failure semantics."""
+    """Run a bounded provider call with retry/backoff and safe failure semantics.
+
+    A single wall-clock budget (``PROVIDER_TIMEOUT_SECONDS``) covers *all*
+    attempts, so retries cannot multiply the worst-case latency: a fast-failing
+    transient error is retried within the budget, while a genuine hang consumes
+    the budget once instead of ``PROVIDER_RETRIES + 1`` times.
+    """
     if not provider_semaphore.acquire(timeout=PROVIDER_TIMEOUT_SECONDS):
         raise ProviderError("Market-data service is busy; please retry shortly")
     try:
+        deadline = time.monotonic() + PROVIDER_TIMEOUT_SECONDS
         last_error: Exception | None = None
         for attempt in range(PROVIDER_RETRIES + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             future = provider_executor.submit(operation)
             try:
-                return future.result(timeout=PROVIDER_TIMEOUT_SECONDS)
+                return future.result(timeout=remaining)
             except FuturesTimeoutError as exc:
                 future.cancel()
                 last_error = exc
+                break  # The whole budget is spent; retrying cannot help.
             except Exception as exc:  # Provider libraries use many exception types.
                 last_error = exc
             if attempt < PROVIDER_RETRIES:
-                time.sleep(0.15 * (2 ** attempt))
+                backoff = 0.15 * (2 ** attempt)
+                if time.monotonic() + backoff >= deadline:
+                    break
+                time.sleep(backoff)
         log_event("provider_failure", provider=name, error_type=type(last_error).__name__ if last_error else "unknown")
         raise ProviderError("Market-data provider is temporarily unavailable") from last_error
     finally:
@@ -175,6 +193,16 @@ async def production_guardrails(request: Request, call_next):
         content_length = request.headers.get("content-length")
         if content_length and (not content_length.isdigit() or int(content_length) > MAX_REQUEST_BYTES):
             return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+        # The Content-Length header is advisory: a chunked or mis-declared upload
+        # can omit or understate it. Enforce the cap against the bytes actually
+        # received, short-circuiting before the whole payload is buffered, then
+        # cache the body so the downstream handler can still parse it.
+        body = b""
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > MAX_REQUEST_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+        request._body = body
     if path.startswith("/api/"):
         client = request.client.host if request.client else "unknown"
         if is_rate_limited(client):
@@ -218,7 +246,7 @@ class AnalyticsRequest(DashboardRequest):
 def _load_url_once(url: str, headers: dict | None = None) -> bytes:
     request = UrlRequest(url, headers=headers or YAHOO_HEADERS)
     try:
-        with urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+        with urlopen(request, timeout=PROVIDER_NETWORK_TIMEOUT_SECONDS) as response:
             payload = response.read(5 * 1024 * 1024 + 1)
             if len(payload) > 5 * 1024 * 1024:
                 raise ValueError("Provider response is too large")
@@ -336,12 +364,28 @@ def fetch_yahoo_equity_quote(symbol: str) -> dict:
     return parse_yahoo_chart_payload(payload, symbol_value)
 
 
+_pricer_build_lock = threading.Lock()
+
+
 def build_pricer() -> None:
+    """Ensure the native pricing binary is available.
+
+    In a packaged/Docker runtime only the prebuilt binary is shipped (no C++
+    source or toolchain).  In that case the existing binary is used as-is and we
+    never stat a missing source or attempt a rebuild.  A rebuild is only run when
+    the source exists and the binary is missing or older than the source, and it
+    is serialized so concurrent requests cannot invoke `make` at the same time.
+    """
     source_path = CPP_DIR / "main.cpp"
-    if not BINARY_PATH.exists() or BINARY_PATH.stat().st_mtime < source_path.stat().st_mtime:
-        subprocess.run(["make"], cwd=CPP_DIR, check=True)
-    if not BINARY_PATH.exists():
-        raise RuntimeError("Pricing binary could not be built")
+    with _pricer_build_lock:
+        source_exists = source_path.exists()
+        needs_build = source_exists and (
+            not BINARY_PATH.exists() or BINARY_PATH.stat().st_mtime < source_path.stat().st_mtime
+        )
+        if needs_build:
+            subprocess.run(["make"], cwd=CPP_DIR, check=True)
+        if not BINARY_PATH.exists():
+            raise RuntimeError("Pricing binary is unavailable and cannot be built (no C++ source/toolchain)")
 
 
 def parse_engine_output(output: str) -> dict:
@@ -435,7 +479,7 @@ def get_nse_equities() -> list[dict]:
 def get_crypto_symbol_list() -> list[str]:
     def load() -> list[str]:
         try:
-            exchange = ccxt.binance({"enableRateLimit": True, "timeout": int(PROVIDER_TIMEOUT_SECONDS * 1000)})
+            exchange = ccxt.binance({"enableRateLimit": True, "timeout": int(PROVIDER_NETWORK_TIMEOUT_SECONDS * 1000)})
             markets = provider_call("binance", exchange.load_markets)
             return sorted(symbol for symbol in markets if symbol.endswith("/USDT"))
         except ProviderError:
@@ -540,7 +584,7 @@ def _annualization_factor(series: list[dict] | None) -> int:
     return 252 * bars_per_session
 
 
-def calculate_realized_vol(series: list[dict] | None, annualization: int = 252) -> float:
+def calculate_realized_vol(series: list[dict] | None, annualization: int | None = None) -> float:
     closes = _series_closes(series)
     if len(closes) < 2:
         return 0.0
@@ -553,43 +597,77 @@ def calculate_realized_vol(series: list[dict] | None, annualization: int = 252) 
         returns.append(math.log(current / prev))
     if not returns:
         return 0.0
-    annualization = _annualization_factor(series) if annualization == 252 else annualization
-    return round(statistics.pstdev(returns) * math.sqrt(annualization), 4)
+    # Auto-detect the observations-per-year from the series cadence unless the
+    # caller passes an explicit factor.
+    factor = _annualization_factor(series) if annualization is None else annualization
+    return round(statistics.pstdev(returns) * math.sqrt(factor), 4)
 
 
 def calculate_gk_vol(series: list[dict] | None) -> float:
+    """Garman–Klass volatility from per-bar OHLC data.
+
+    Uses the standard estimator ``0.5·ln(H/L)² − (2·ln2 − 1)·ln(C/O)²`` per bar.
+    When a feed omits the per-bar open (some intraday NSE bars do), the prior
+    bar's close is used as the open proxy so the intraday term stays defined.
+    """
     if not isinstance(series, list) or len(series) < 2:
         return 0.0
     total = 0.0
     observations = 0
-    for idx in range(1, len(series)):
-        prev = series[idx - 1]
-        current = series[idx]
-        if not isinstance(prev, dict) or not isinstance(current, dict):
+    prev_close = None
+    for item in series:
+        if not isinstance(item, dict):
             continue
-        prev_close = safe_float(prev.get("close"))
-        current_close = safe_float(current.get("close"))
-        if prev_close is None or current_close is None or prev_close <= 0 or current_close <= 0:
+        close = safe_float(item.get("close"))
+        high = safe_float(item.get("high"))
+        low = safe_float(item.get("low"))
+        open_price = safe_float(item.get("open"))
+        if open_price is None:
+            open_price = prev_close
+        if close is None or close <= 0:
             continue
-        high = safe_float(current.get("high"))
-        low = safe_float(current.get("low"))
-        if high is None or low is None or high <= 0 or low <= 0 or high < low:
-            continue
-        log_hl = math.log(high / low)
-        log_ret = math.log(current_close / prev_close)
-        total += 0.5 * (log_hl * log_hl) - (2 * math.log(2) - 1) * (log_ret * log_ret)
-        observations += 1
+        if (high is not None and low is not None and open_price is not None
+                and high > 0 and low > 0 and open_price > 0 and high >= low):
+            log_hl = math.log(high / low)
+            log_co = math.log(close / open_price)
+            total += 0.5 * (log_hl * log_hl) - (2 * math.log(2) - 1) * (log_co * log_co)
+            observations += 1
+        prev_close = close
     if not observations:
         return 0.0
     return round(math.sqrt(max(total, 0.0) / observations) * math.sqrt(_annualization_factor(series)), 4)
 
 
+def calculate_ewma_vol(series: list[dict] | None, lam: float = 0.94) -> float:
+    """RiskMetrics-style EWMA volatility over the log-return series.
+
+    Recursively updates the variance ``σ²_t = λ·σ²_{t-1} + (1 − λ)·r_t²`` so the
+    most recent observations carry more weight, then annualizes with the same
+    cadence-derived factor as the realized/GK estimators.
+    """
+    closes = _series_closes(series)
+    if len(closes) < 2:
+        return 0.0
+    returns = []
+    for idx in range(1, len(closes)):
+        prev = closes[idx - 1]
+        current = closes[idx]
+        if prev > 0 and current > 0:
+            returns.append(math.log(current / prev))
+    if not returns:
+        return 0.0
+    variance = returns[0] * returns[0]
+    for r in returns[1:]:
+        variance = lam * variance + (1 - lam) * r * r
+    return round(math.sqrt(variance * _annualization_factor(series)), 4)
+
+
 def build_volatility_summary(series: list[dict] | None, iv: float) -> dict:
     realized = calculate_realized_vol(series)
     gk = calculate_gk_vol(series) or realized
-    ewma = realized if realized else max(iv, 0.01)
-    if realized:
-        ewma = round(math.sqrt(0.94 * (ewma * ewma) + 0.06 * (realized * realized)), 4)
+    ewma = calculate_ewma_vol(series)
+    if not ewma:
+        ewma = realized if realized else max(iv, 0.01)
     ratio = (iv / realized) if realized else 0.0
     if realized and ratio > 1.5:
         regime = "rich"
@@ -661,18 +739,6 @@ def monte_carlo_price(spot: float, strike: float, rate: float, maturity: float, 
     return round(math.exp(-rate * maturity) * total / (2 * max(paths // 2, 1)), 4)
 
 
-def build_sensitivity_surface(spot: float, strike: float, rate: float, maturity: float,
-                              vol: float, option_type: str) -> list[dict]:
-    """Compact strike × DTE Greek grid suitable for a heat-map or a mobile table."""
-    rows = []
-    for dte in (7, 30, 90, 180):
-        for multiplier in (0.85, 0.925, 1.0, 1.075, 1.15):
-            row_strike = round(strike * multiplier, 2)
-            values = black_scholes_price_and_greeks(spot, row_strike, rate, dte / 365, vol, option_type)
-            rows.append({"strike": row_strike, "dte": dte, **{key: round(value, 5) for key, value in values.items()}})
-    return rows
-
-
 VALID_STRATEGIES = {"long_call", "long_put", "short_call", "short_put", "straddle", "collar"}
 
 
@@ -708,12 +774,12 @@ def strategy_legs(strike: float, strategy: str) -> list[dict]:
 def build_strategy_position(spot: float, strike: float, rate: float, maturity: float,
                             vol: float, strategy: str) -> dict:
     """Price all legs and aggregate their Black--Scholes Greeks."""
-    totals = {"price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+    totals = {"price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
     legs = []
     for leg in strategy_legs(strike, strategy):
         quantity = leg["quantity"]
         if leg["kind"] == "stock":
-            values = {"price": spot, "delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+            values = {"price": spot, "delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
             description = "Long underlying"
         else:
             values = black_scholes_price_and_greeks(
@@ -1062,7 +1128,11 @@ def api_analytics(payload: AnalyticsRequest) -> dict:
                                            payload.maturity, payload.vol, payload.strategy)
         return {
             **dashboard,
-            "greeks": {key: round(value, 5) for key, value in position["greeks"].items()},
+            "greeks": {
+                key: round(value, 5)
+                for key, value in position["greeks"].items()
+                if key != "price"
+            },
             "surface": build_strategy_surface(payload.spot, payload.strike, payload.rate, payload.maturity,
                                               payload.vol, payload.strategy),
             "payoff": build_strategy_payoff(payload.spot, position, payload.strategy),
@@ -1142,4 +1212,9 @@ if (FRONTEND_DIR / "index.html").exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # Bind to loopback by default so `python app.py` never exposes the dev server
+    # on the local network unintentionally. Set HOST=0.0.0.0 (as the Docker image
+    # does) to serve publicly on purpose.
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host=host, port=port, reload=True)

@@ -14,7 +14,9 @@ from app import (
     build_strategy_payoff,
     build_strategy_position,
     build_volatility_summary,
+    calculate_ewma_vol,
     calculate_gk_vol,
+    calculate_realized_vol,
     health_check,
     is_rate_limited,
     parse_yahoo_chart_payload,
@@ -100,6 +102,21 @@ class TestDashboardHelpers(unittest.TestCase):
             with self.subTest(values=values):
                 with self.assertRaises(ValidationError):
                     AnalyticsRequest(spot=100, strike=100, **values)
+
+    def test_ewma_weights_recent_returns_and_is_not_a_noop(self):
+        spiking = [
+            {"close": 100.0}, {"close": 101.0}, {"close": 100.5},
+            {"close": 101.2}, {"close": 100.8}, {"close": 112.0},
+        ]
+        ewma = calculate_ewma_vol(spiking)
+        realized = calculate_realized_vol(spiking)
+        self.assertGreater(ewma, 0.0)
+        # The old implementation collapsed EWMA onto realized vol; a genuine
+        # RiskMetrics estimate weights observations differently.
+        self.assertGreater(abs(ewma - realized), 0.01)
+        summary = build_volatility_summary(spiking, 0.25)
+        self.assertEqual(summary["ewmaVol"], ewma)
+        self.assertEqual(summary["forward30d"], round(ewma * (30 / 365) ** 0.5, 4))
 
     def test_garman_klass_requires_valid_ohlc_data(self):
         self.assertEqual(calculate_gk_vol([{"close": 100}, {"close": None}]), 0.0)

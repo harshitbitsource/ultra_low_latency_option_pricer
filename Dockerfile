@@ -9,7 +9,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --create-home --uid 10001 appuser
+# Only the prebuilt binary is shipped to the runtime image (no C++ source or
+# toolchain). app.build_pricer() detects the missing source and uses this binary
+# as-is instead of trying to rebuild it.
 COPY --chown=appuser:appuser --from=cpp-builder /usr/src/ultra_low_latency_option_pricer/cpp/option_pricer ./cpp/option_pricer
+RUN chmod +x ./cpp/option_pricer
 COPY --chown=appuser:appuser app.py ./
 COPY --chown=appuser:appuser frontend ./frontend
 USER appuser

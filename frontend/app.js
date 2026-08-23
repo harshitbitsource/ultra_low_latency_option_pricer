@@ -9,6 +9,7 @@
   let greek = "delta";
   let quoteSeries = null;
   let suggestionTimer;
+  let analysisTimer;
   let suggestionRequest;
   let analyticsRequest;
   let quoteRequest;
@@ -90,7 +91,23 @@
         if (greekRows.length) drawChart("greek-chart", greekRows, "value", "#b28cff", { zero: greek === "theta" });
         else drawUnavailable("greek-chart", "No sensitivity data available");
       } catch (error) { console.error("Greek chart failed", error); }
-      drawUnavailable("vol-chart", "Historical IV series is unavailable without an option-chain provider");
+      try {
+        const ivLevel = Number(data.impliedVol?.marketIv);
+        const rvLevel = Number(data.volatility?.realizedVol);
+        if (Number.isFinite(ivLevel) && ivLevel > 0) {
+          // Two model-derived levels (estimated IV vs realized vol) drawn as
+          // flat references so the panel visibly tracks the volatility input:
+          // changing vol moves the implied line, honouring the card legend.
+          const span = 24;
+          const ivRows = Array.from({ length: span }, () => ({ v: ivLevel }));
+          const rvRows = Number.isFinite(rvLevel) && rvLevel > 0
+            ? Array.from({ length: span }, () => ({ v: rvLevel }))
+            : [];
+          drawChart("vol-chart", ivRows, "v", "#b28cff", { zero: true, overlay: rvRows });
+        } else {
+          drawUnavailable("vol-chart", "Estimated IV is unavailable for these inputs");
+        }
+      } catch (error) { console.error("Vol chart failed", error); }
     }));
   }
 
@@ -290,6 +307,16 @@
     if (event.key === "Enter") { event.preventDefault(); loadQuote(); }
   });
   byId("strategy").onchange = runAnalysis;
+  // Recompute (debounced) whenever a pricing input changes so every dependent
+  // chart — model prices, Greek surface, vol panel, scenario P&L — tracks the
+  // inputs live instead of only updating on an explicit "Run".
+  const debouncedAnalysis = () => {
+    clearTimeout(analysisTimer);
+    analysisTimer = setTimeout(runAnalysis, 220);
+  };
+  ["spot", "strike", "vol", "rate", "maturity"].forEach((id) => {
+    byId(id).addEventListener("input", debouncedAnalysis);
+  });
   byId("type").onchange = () => {
     const strategy = byId("strategy");
     if (strategy.value === "long_call" || strategy.value === "long_put") strategy.value = `long_${byId("type").value}`;
