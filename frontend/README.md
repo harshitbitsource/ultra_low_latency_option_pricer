@@ -17,6 +17,7 @@ Open `http://127.0.0.1:8000` in a browser.
 - Edit the market inputs in the left panel.
 - Click `Run analytics` to update model prices, Greeks, volatility, payoff and
   scenario charts.
-- The C++ benchmark engine is available independently through `/api/price`.
+- Dashboard Black–Scholes prices use the native C++ shared library in-process.
+- The native benchmark endpoint remains available through `/api/price`.
 - Select a strategy to model its full position, including short call, short put,
   ATM straddle and collar structures.

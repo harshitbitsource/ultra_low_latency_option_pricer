@@ -13,12 +13,15 @@ from app import (
     build_dashboard_payload,
     build_strategy_payoff,
     build_strategy_position,
+    build_strategy_surface,
     build_volatility_summary,
     calculate_ewma_vol,
     calculate_gk_vol,
     calculate_realized_vol,
+    fetch_nse_stock_quote,
     health_check,
     is_rate_limited,
+    native_black_scholes_price,
     parse_yahoo_chart_payload,
     provider_call,
     strategy_metrics,
@@ -42,6 +45,13 @@ class TestDashboardHelpers(unittest.TestCase):
         self.assertIn("marketPrice", payload)
         self.assertIn("volatility", payload)
         self.assertIn("impliedVol", payload)
+        self.assertAlmostEqual(
+            payload["modelPrice"],
+            native_black_scholes_price(100.0, 100.0, 0.05, 1.0, 0.2, "call"),
+            places=4,
+        )
+        self.assertIn("monteCarloMs", payload["latency"])
+        self.assertGreaterEqual(payload["latency"]["analyticsMs"], payload["latency"]["monteCarloMs"])
 
     def test_black_scholes_rejects_unknown_option_type(self):
         with self.assertRaises(ValueError):
@@ -51,7 +61,7 @@ class TestDashboardHelpers(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AnalyticsRequest(spot=0, strike=100, strategy="long_call")
         with self.assertRaises(ValidationError):
-            AnalyticsRequest(spot=100, strike=100, strategy="unknown")
+            AnalyticsRequest.model_validate({"spot": 100, "strike": 100, "strategy": "unknown"})
 
     def test_strategy_payoffs_and_risk_have_correct_direction(self):
         long_call = build_strategy_position(100.0, 100.0, 0.05, 1.0, 0.2, "long_call")
@@ -102,6 +112,40 @@ class TestDashboardHelpers(unittest.TestCase):
             with self.subTest(values=values):
                 with self.assertRaises(ValidationError):
                     AnalyticsRequest(spot=100, strike=100, **values)
+
+    def test_strategy_surface_expiries_scale_with_selected_maturity(self):
+        one_year = build_strategy_surface(100, 100, 0.05, 1, 0.2, "long_call")
+        two_years = build_strategy_surface(100, 100, 0.05, 2, 0.2, "long_call")
+        one_year_expiries = {row["dte"] for row in one_year}
+        two_year_expiries = {row["dte"] for row in two_years}
+        self.assertEqual(len(one_year), 20)
+        self.assertEqual(len(two_years), 20)
+        self.assertEqual(one_year_expiries, {91, 183, 274, 365})
+        self.assertEqual(two_year_expiries, {183, 365, 548, 730})
+        self.assertEqual(max(one_year_expiries), 365)
+        self.assertEqual(max(two_year_expiries), 730)
+        self.assertNotEqual(one_year_expiries, two_year_expiries)
+
+    def test_volatility_summary_marks_missing_series_unavailable(self):
+        summary = build_volatility_summary([], 0.25)
+        self.assertIsNone(summary["realizedVol"])
+        self.assertIsNone(summary["gkVol"])
+        self.assertIsNone(summary["ewmaVol"])
+        self.assertIsNone(summary["forward30d"])
+        self.assertIsNone(summary["ivVsRealized"])
+        self.assertEqual(summary["regime"], "unavailable")
+        one_bar = build_volatility_summary([{"close": 100.0}], 0.25)
+        self.assertIsNone(one_bar["realizedVol"])
+        self.assertIsNone(one_bar["gkVol"])
+
+    def test_realized_vol_ignores_overnight_gaps_in_intraday_data(self):
+        series = [
+            {"ts": 0, "close": 100.0},
+            {"ts": 300, "close": 101.0},
+            {"ts": 86400, "close": 200.0},
+            {"ts": 86700, "close": 201.0},
+        ]
+        self.assertLess(calculate_realized_vol(series), 1.0)
 
     def test_ewma_weights_recent_returns_and_is_not_a_noop(self):
         spiking = [
@@ -184,6 +228,41 @@ class TestYahooChartParser(unittest.TestCase):
         quote = parse_yahoo_chart_payload(payload, "TEST.NS")
         self.assertEqual(quote["highPrice"], 102.0)
         self.assertEqual(quote["lowPrice"], 98.0)
+
+
+class TestQuoteHistory(unittest.TestCase):
+    def test_nse_quote_is_enriched_with_supplemental_history(self):
+        series = [{"ts": 300, "close": 101.0}]
+        with (
+            patch("app.provider_cache.get_or_load", side_effect=lambda key, ttl, loader: loader()),
+            patch("app.provider_call", side_effect=lambda name, operation: operation()),
+            patch("app.nsesymbolpurify", side_effect=lambda symbol: symbol),
+            patch("app.nse_quote", return_value={"priceInfo": {"lastPrice": 100.0}}),
+            patch("app.fetch_yahoo_equity_quote", return_value={
+                "series": series, "historySource": "Yahoo Finance",
+            }),
+        ):
+            quote = fetch_nse_stock_quote("TCS")
+
+        self.assertEqual(quote["lastPrice"], 100.0)
+        self.assertEqual(quote["series"], series)
+        self.assertEqual(quote["historyStatus"], "available")
+        self.assertEqual(quote["historySource"], "Yahoo Finance")
+
+    def test_nse_quote_reports_history_failure_without_losing_quote(self):
+        with (
+            patch("app.provider_cache.get_or_load", side_effect=lambda key, ttl, loader: loader()),
+            patch("app.provider_call", side_effect=lambda name, operation: operation()),
+            patch("app.nsesymbolpurify", side_effect=lambda symbol: symbol),
+            patch("app.nse_quote", return_value={"priceInfo": {"lastPrice": 100.0}}),
+            patch("app.fetch_yahoo_equity_quote", side_effect=ValueError("history unavailable")),
+        ):
+            quote = fetch_nse_stock_quote("TCS")
+
+        self.assertEqual(quote["lastPrice"], 100.0)
+        self.assertEqual(quote["series"], [])
+        self.assertEqual(quote["historyStatus"], "unavailable")
+        self.assertIn("historical bars", quote["historyMessage"])
 
 
 class TestApiSafety(unittest.TestCase):

@@ -5,7 +5,7 @@
   // Small DOM + formatting helpers
   // ---------------------------------------------------------------------------
   const byId = (id) => document.getElementById(id);
-  const isNum = (value) => value != null && Number.isFinite(Number(value));
+  const isNum = (value) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
   const num = (value) => Number(value);
   const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
   const number = (value) => (!isNum(value) ? "—" : num(value).toLocaleString("en-IN", { maximumFractionDigits: 2 }));
@@ -110,6 +110,12 @@
 
   const PALETTE = { grid: "#22344c", text: "#8fa2bc", bg: "#0b1728", zero: "#6c7f9a", crosshair: "#41597d" };
 
+  function chartPalette() {
+    return document.body.classList.contains("light")
+      ? { grid: "#dbe4ef", text: "#687b95", bg: "#f7faff", zero: "#8495aa", crosshair: "#526b8b" }
+      : PALETTE;
+  }
+
   function ensureTooltip(canvas) {
     let tip = canvas._tooltip;
     if (tip) return tip;
@@ -126,12 +132,14 @@
   }
 
   function sizeCanvas(canvas) {
-    const cssWidth = Math.max(canvas.clientWidth || canvas.parentElement?.clientWidth || 0, 280);
-    const cssHeight = Number(canvas.getAttribute("height")) || 220;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(cssWidth * dpr);
-    canvas.height = Math.round(cssHeight * dpr);
     canvas.style.width = "100%";
+    const cssWidth = Math.max(canvas.clientWidth || canvas.parentElement?.clientWidth || 0, 280);
+    const cssHeight = canvas.clientHeight || Number(canvas.getAttribute("height")) || 220;
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.round(cssWidth * dpr);
+    const pixelHeight = Math.round(cssHeight * dpr);
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     return { ctx, width: cssWidth, height: cssHeight };
@@ -148,14 +156,15 @@
 
   function paint(canvas, config) {
     const { ctx, width, height } = sizeCanvas(canvas);
+    const palette = chartPalette();
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = PALETTE.bg;
+    ctx.fillStyle = palette.bg;
     ctx.fillRect(0, 0, width, height);
 
     const series = finitePoints(config.series).filter((s) => s.points.length);
     const allPoints = series.flatMap((s) => s.points);
     if (!allPoints.length) {
-      ctx.fillStyle = PALETTE.text;
+      ctx.fillStyle = palette.text;
       ctx.font = "12px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.fillText(config.placeholder || "No data available", width / 2, height / 2);
@@ -182,9 +191,9 @@
     for (let i = 0; i <= 4; i += 1) {
       const gy = PADT + (i / 4) * plotH;
       const value = yMax - (i / 4) * (yMax - yMin);
-      ctx.strokeStyle = PALETTE.grid; ctx.lineWidth = 1;
+      ctx.strokeStyle = palette.grid; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(PADL, gy); ctx.lineTo(width - PADR, gy); ctx.stroke();
-      ctx.fillStyle = PALETTE.text; ctx.textAlign = "right";
+      ctx.fillStyle = palette.text; ctx.textAlign = "right";
       ctx.fillText((config.yFormat || number)(value), PADL - 6, gy);
     }
     // x-axis tick labels
@@ -192,12 +201,12 @@
     for (let i = 0; i <= 4; i += 1) {
       const value = xMin + (i / 4) * (xMax - xMin);
       const gx = clamp(X(value), PADL + 12, width - PADR - 12);
-      ctx.fillStyle = PALETTE.text;
+      ctx.fillStyle = palette.text;
       ctx.fillText((config.xFormat || number)(value), gx, height - PADB + 8);
     }
 
-    drawSeriesAndMarkers(ctx, config, series, { X, Y, xMin, xMax, yMin, yMax, plotH });
-    chartState.set(canvas.id, { config, series, geom: { X, Y, xMin, xMax, yMin, yMax, width, height, plotH } });
+    drawSeriesAndMarkers(ctx, config, series, { X, Y, xMin, xMax, yMin, yMax, width, height, plotH }, palette);
+    chartState.set(canvas.id, { config, series, palette, geom: { X, Y, xMin, xMax, yMin, yMax, width, height, plotH } });
   }
 
   function hexToRgba(hex, alpha) {
@@ -206,13 +215,13 @@
     return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${alpha})`;
   }
 
-  function drawSeriesAndMarkers(ctx, config, series, g) {
+  function drawSeriesAndMarkers(ctx, config, series, g, palette) {
     const { X, Y, xMin, xMax, yMin, yMax } = g;
     const clampY = (y) => clamp(Y(y), PADT, PADT + g.plotH);
     // Horizontal reference lines (e.g. zero P&L, premium paid)
     for (const h of config.hlines || []) {
       if (!isNum(h.y) || h.y < yMin || h.y > yMax) continue;
-      ctx.strokeStyle = h.color || PALETTE.zero; ctx.lineWidth = 1;
+      ctx.strokeStyle = h.color || palette.zero; ctx.lineWidth = 1;
       ctx.setLineDash(h.dash || [4, 4]);
       ctx.beginPath(); ctx.moveTo(X(xMin), Y(h.y)); ctx.lineTo(X(xMax), Y(h.y)); ctx.stroke();
       ctx.setLineDash([]);
@@ -234,6 +243,12 @@
       ctx.beginPath();
       s.points.forEach((p, i) => (i ? ctx.lineTo(X(p.x), clampY(p.y)) : ctx.moveTo(X(p.x), clampY(p.y))));
       ctx.stroke();
+      if (s.points.length === 1) {
+        ctx.fillStyle = s.color || "#73a7ff";
+        ctx.beginPath();
+        ctx.arc(X(s.points[0].x), clampY(s.points[0].y), 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
     // Vertical markers (current spot, break-evens, current vol …)
     for (const v of config.vlines || []) {
@@ -263,9 +278,10 @@
       console.error(`chart ${id} failed`, err);
       try {
         const { ctx, width, height } = sizeCanvas(canvas);
+        const palette = chartPalette();
         ctx.clearRect(0, 0, width, height);
-        ctx.fillStyle = PALETTE.bg; ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = PALETTE.text; ctx.font = "12px system-ui, sans-serif";
+        ctx.fillStyle = palette.bg; ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = palette.text; ctx.font = "12px system-ui, sans-serif";
         ctx.textAlign = "center";
         ctx.fillText(config.placeholder || "Chart unavailable", width / 2, height / 2);
       } catch { /* nothing more we can do */ }
@@ -289,8 +305,20 @@
       });
       ro.observe(canvas.parentElement || canvas);
     }
-    canvas.addEventListener("mousemove", (evt) => showCrosshair(canvas, evt));
-    canvas.addEventListener("mouseleave", () => {
+    let pointerFrame = 0;
+    let latestPointerEvent;
+    canvas.addEventListener("pointermove", (evt) => {
+      latestPointerEvent = evt;
+      if (pointerFrame) return;
+      pointerFrame = requestAnimationFrame(() => {
+        pointerFrame = 0;
+        if (latestPointerEvent) showCrosshair(canvas, latestPointerEvent);
+      });
+    });
+    canvas.addEventListener("pointerleave", () => {
+      cancelAnimationFrame(pointerFrame);
+      pointerFrame = 0;
+      latestPointerEvent = null;
       repaint(canvas);
       const tip = canvas._tooltip;
       if (tip) tip.style.opacity = "0";
@@ -305,7 +333,7 @@
     repaint(canvas);
     const fresh = chartState.get(canvas.id);
     if (!fresh) return;
-    const { config, series, geom } = fresh;
+    const { config, series, palette, geom } = fresh;
     const { X, Y, xMin, xMax } = geom;
     const rect = canvas.getBoundingClientRect();
     const px = evt.clientX - rect.left;
@@ -319,7 +347,7 @@
     });
     const anchorX = primary.points[idx].x;
     const ctx = canvas.getContext("2d");
-    ctx.strokeStyle = PALETTE.crosshair; ctx.lineWidth = 1;
+    ctx.strokeStyle = palette.crosshair; ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(X(anchorX), PADT); ctx.lineTo(X(anchorX), PADT + geom.plotH); ctx.stroke();
     ctx.setLineDash([]);
@@ -335,9 +363,15 @@
       rows.push(`<span style="color:${s.color || "#73a7ff"}">●</span> ${escapeHtml(s.label || "")} <b>${(config.tipFormat || config.yFormat || number)(pt.y)}</b>`);
     }
     const tip = ensureTooltip(canvas);
-    tip.innerHTML = `<div style="color:${PALETTE.text};margin-bottom:2px">${(config.xFormat || number)(anchorX)}</div>${rows.join("<br>")}`;
-    tip.style.left = `${clamp(X(anchorX), 60, geom.width - 60)}px`;
-    tip.style.top = `${PADT + 6}px`;
+    const parent = canvas.parentElement || document.body;
+    const canvasRect = canvas.getBoundingClientRect();
+    const parentRect = parent.getBoundingClientRect();
+    const tooltipX = canvasRect.left - parentRect.left + X(anchorX);
+    const pointerY = clamp(evt.clientY - canvasRect.top, PADT, geom.height - PADB);
+    const tooltipY = canvasRect.top - parentRect.top + pointerY - 8;
+    tip.innerHTML = `<div style="color:${palette.text};margin-bottom:2px">${(config.xFormat || number)(anchorX)}</div>${rows.join("<br>")}`;
+    tip.style.left = `${clamp(tooltipX, 60, Math.max(60, parent.clientWidth - 60))}px`;
+    tip.style.top = `${Math.max(28, tooltipY)}px`;
     tip.style.opacity = "1";
   }
 
@@ -399,15 +433,23 @@
     const { spot, strike, rate, maturity, vol, strategy } = inp;
     const legs = buildLegs(strike, strategy);
     const cost = positionMetric(legs, "price", spot, strike, rate, maturity, vol);
-    const lo = Math.max(1, spot * 0.5), hi = spot * 1.5;
+    const m = metricsFor(strategy, strike, cost);
+    const validBreakEvens = (m.be || []).filter((value) => isNum(value) && num(value) > 0).map(num);
+    const lowAnchors = [spot * 0.5, strike * 0.5, ...validBreakEvens.map((value) => value * 0.95)];
+    const highAnchors = [spot * 1.5, strike * 1.5, ...validBreakEvens.map((value) => value * 1.05)];
+    const lo = Math.max(1, Math.min(...lowAnchors));
+    const hi = Math.max(...highAnchors);
+    const terminals = new Set(
+      Array.from({ length: 81 }, (_, i) => lo + (i / 80) * (hi - lo))
+        .concat([spot, strike, ...validBreakEvens])
+        .filter((value) => value >= lo && value <= hi),
+    );
     const points = [];
-    for (let i = 0; i <= 80; i += 1) {
-      const terminal = lo + (i / 80) * (hi - lo);
+    for (const terminal of [...terminals].sort((a, b) => a - b)) {
       const pnl = expiryValue(legs, terminal, strike) - cost;
       if (isNum(pnl)) points.push({ x: terminal, y: pnl });
     }
-    const m = metricsFor(strategy, strike, cost);
-    const breakEvens = (m.be || []).filter((b) => isNum(b) && b >= lo && b <= hi);
+    const breakEvens = validBreakEvens.filter((value) => value >= lo && value <= hi);
     drawLineChart("payoff-chart", {
       series: [{ points, color: "#48d4a0", fill: true, label: "P&L", width: 2.6 }],
       hlines: [{ y: 0, color: "#6c7f9a", dash: [5, 4] }],
@@ -429,20 +471,22 @@
   }
 
   // ---- Volatility vs price ---------------------------------------------------
-  // Position value swept across implied volatility, with markers at the current
-  // IV (purple) and realized vol (green) so the card legend stays meaningful.
+  // Position value swept across volatility, with IV and RV reference markers.
   function renderVolPriceChart(inp, data) {
     const { spot, strike, rate, maturity, vol, strategy } = inp;
     const legs = buildLegs(strike, strategy);
+    const realizedValue = data?.volatility?.realizedVol;
+    const realized = isNum(realizedValue) ? num(realizedValue) : NaN;
+    const minVol = Math.max(0.001, Math.min(0.02, vol * 0.5));
+    const maxVol = Math.max(1.2, vol * 1.1, isNum(realized) ? realized * 1.1 : 0);
     const points = [];
     for (let i = 0; i <= 80; i += 1) {
-      const v = 0.02 + (i / 80) * (1.2 - 0.02);
+      const v = minVol + (i / 80) * (maxVol - minVol);
       const price = positionMetric(legs, "price", spot, strike, rate, maturity, v);
       if (isNum(price)) points.push({ x: v, y: price });
     }
-    const realized = num(data?.volatility?.realizedVol);
     const vlines = [{ x: vol, color: "#b28cff", label: "IV", dash: [4, 4] }];
-    if (isNum(realized) && realized > 0 && realized <= 1.2) {
+    if (isNum(realized) && realized > 0) {
       vlines.push({ x: realized, color: "#48d4a0", label: "RV", dash: [4, 4] });
     }
     drawLineChart("vol-chart", {
@@ -450,16 +494,14 @@
       vlines, yFormat: (v) => `₹${number(v)}`, xFormat: (v) => percent(v),
       tipFormat: (v) => `₹${number(v)}`, placeholder: "Adjust inputs to plot value vs vol",
     });
-    if (data?.volatility) {
-      const vsum = data.volatility;
-      setText("vol-regime", vsum.regime || "—");
-      const info = byId("vol-info");
-      if (info) {
-        info.innerHTML =
-          `<span>Garman–Klass <b>${percent(vsum.gkVol)}</b></span>` +
-          `<span>30d forecast <b>${percent(vsum.forward30d)}</b></span>` +
-          `<span>IV / RV <b>${isNum(vsum.ivVsRealized) ? num(vsum.ivVsRealized).toFixed(2) : "—"}</b></span>`;
-      }
+    const vsum = data?.volatility || {};
+    setText("vol-regime", vsum.regime || "unavailable");
+    const info = byId("vol-info");
+    if (info) {
+      info.innerHTML =
+        `<span>Garman–Klass <b>${percent(vsum.gkVol)}</b></span>` +
+        `<span>30d forecast <b>${percent(vsum.forward30d)}</b></span>` +
+        `<span>IV / RV <b>${isNum(vsum.ivVsRealized) ? num(vsum.ivVsRealized).toFixed(2) : "—"}</b></span>`;
     }
   }
 
@@ -505,11 +547,27 @@
   }
 
   // ---- Greeks surface table --------------------------------------------------
-  function renderSurface(data) {
+  function renderSurface(inp) {
     const tbody = document.querySelector("#surface tbody");
     if (!tbody) return;
-    const rows = Array.isArray(data?.surface) ? data.surface : [];
-    const metric = GREEK_META[greek] && greek !== "price" ? greek : "delta";
+    const expiries = [...new Set([0.25, 0.5, 0.75, 1].map((fraction) =>
+      Math.max(1, Math.round(inp.maturity * 365 * fraction))))];
+    const rows = expiries.flatMap((dte) =>
+      [0.85, 0.925, 1, 1.075, 1.15].map((multiplier) => {
+        const rowStrike = inp.strike * multiplier;
+        const legs = buildLegs(rowStrike, inp.strategy);
+        const maturity = dte / 365;
+        return {
+          dte,
+          strike: round4(rowStrike),
+          price: positionMetric(legs, "price", inp.spot, rowStrike, inp.rate, maturity, inp.vol),
+          delta: positionMetric(legs, "delta", inp.spot, rowStrike, inp.rate, maturity, inp.vol),
+          gamma: positionMetric(legs, "gamma", inp.spot, rowStrike, inp.rate, maturity, inp.vol),
+          vega: positionMetric(legs, "vega", inp.spot, rowStrike, inp.rate, maturity, inp.vol),
+        };
+      }),
+    );
+    const metric = GREEK_META[greek] ? greek : "delta";
     const maxAbs = Math.max(1e-9, ...rows.map((r) => Math.abs(num(r[metric])) || 0));
     tbody.innerHTML = rows.map((r) => {
       const heat = clamp(Math.abs(num(r[metric])) / maxAbs, 0, 1);
@@ -529,12 +587,14 @@
     const fmtTime = (t) => {
       if (!isNum(t) || t < 1e6) return number(t);
       const d = new Date(num(t) * 1000);
-      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      return new Intl.DateTimeFormat("en-IN", {
+        timeZone: "Asia/Kolkata", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+      }).format(d);
     };
     drawLineChart("quote-chart", {
       series: [{ points, color, fill: true, label: "Close", width: 2.4 }],
       yFormat: (v) => `₹${number(v)}`, xFormat: fmtTime, tipFormat: (v) => `₹${number(v)}`,
-      placeholder: "Fetch a quote to plot the intraday close",
+      placeholder: "Historical quote bars are unavailable",
     });
   }
 
@@ -542,7 +602,7 @@
     renderPayoffChart(inp);
     renderVolPriceChart(inp, data);
     renderGreekChart(inp);
-    renderSurface(data);
+    renderSurface(inp);
   }
 
   // ---------------------------------------------------------------------------
@@ -558,7 +618,7 @@
       : iv.signal === "cheap" ? "Estimated IV cheap vs model" : "Awaiting analysis");
     const vsum = data.volatility || {};
     setText("m-rv", percent(vsum.realizedVol));
-    const ms = data.latency?.analyticsMs ?? data.requestMs;
+    const ms = data.requestMs ?? data.latency?.analyticsMs;
     setText("m-latency", isNum(ms) ? `${num(ms).toFixed(1)} ms` : "—");
     setText("request-time", isNum(data.requestMs) ? `${num(data.requestMs).toFixed(1)} ms` : "—");
     const models = data.models || {};
@@ -615,12 +675,20 @@
   async function runAnalysis() {
     const inp = readInputs();
     // Draw immediately from local math — the UI is never blocked on the server.
-    renderCharts(inp, result);
+    result = null;
+    renderCharts(inp, null);
     updateScenario();
     if (analyticsRequest) analyticsRequest.abort();
     analyticsRequest = new AbortController();
     const revision = (analyticsRevision += 1);
+    setText("m-price", "—");
+    setText("m-iv", "—");
+    setText("m-rv", "—");
+    setText("m-signal", "Awaiting current analysis");
+    setText("m-latency", "—");
     setText("request-time", "…");
+    document.querySelectorAll("#models .model-row strong").forEach((row) => { row.textContent = "—"; });
+    setText("model-note", "Calculating current inputs…");
     try {
       const data = await fetchJSON("/api/analytics", {
         method: "POST",
@@ -638,8 +706,9 @@
       updateScenario();
     } catch (err) {
       if (err.name === "AbortError") return;
+      setText("request-time", "Unavailable");
       const note = byId("model-note");
-      if (note) note.textContent = "Live model comparison unavailable — charts use the in-browser model.";
+      if (note) note.textContent = "Server analytics unavailable. Charts show the in-browser model; server values are cleared.";
     }
   }
 
@@ -650,6 +719,14 @@
     quoteRequest = new AbortController();
     const revision = (quoteRevision += 1);
     const status = byId("quote-status");
+    quoteSeries = [];
+    setText("quote-last", "—");
+    setText("quote-change", "Loading provider quote…");
+    setText("quote-source", "Loading quote history…");
+    setText("quote-symbol", symbol);
+    const stats = byId("quote-stats");
+    if (stats) stats.innerHTML = "<span>Open <b>—</b></span><span>High <b>—</b></span><span>Low <b>—</b></span>";
+    renderQuoteChart();
     if (status) status.innerHTML = "<i></i> Fetching…";
     try {
       const data = await fetchJSON(`/api/stock?symbol=${encodeURIComponent(symbol)}&market=equity`,
@@ -673,14 +750,23 @@
       if (stats) stats.innerHTML =
         `<span>Open <b>${number(q.openPrice)}</b></span><span>High <b>${number(q.highPrice)}</b></span>` +
         `<span>Low <b>${number(q.lowPrice)}</b></span>`;
-      if (status) status.innerHTML = "<i></i> Provider quote";
-      setText("quote-source", `${q.symbol || symbol} · ${quoteSeries.length} intraday bars`);
+      const historyAvailable = quoteSeries.length > 0;
+      if (status) status.innerHTML = historyAvailable
+        ? "<i></i> Provider quote + history"
+        : "<i></i> Quote · history unavailable";
+      setText("quote-source", historyAvailable
+        ? `${q.symbol || symbol} · ${quoteSeries.length} historical bars · ${q.historySource || q.source || "provider"}`
+        : q.historyMessage || "Quote loaded, but no historical bars are available.");
       renderQuoteChart();
       if (isNum(q.lastPrice)) { byId("spot").value = round4(q.lastPrice); scheduleAnalysis(); }
     } catch (err) {
       if (err.name === "AbortError") return;
       if (status) status.innerHTML = "<i></i> Quote unavailable";
+      setText("quote-last", "—");
+      setText("quote-change", "Quote unavailable");
+      if (stats) stats.innerHTML = "<span>Open <b>—</b></span><span>High <b>—</b></span><span>Low <b>—</b></span>";
       setText("quote-source", "Could not load provider quote.");
+      renderQuoteChart();
     }
   }
 
@@ -774,7 +860,7 @@
       btn.classList.add("active");
       greek = btn.textContent.trim().toLowerCase();
       renderGreekChart(readInputs());
-      renderSurface(result);
+      renderSurface(readInputs());
     }));
 
     // Risk shock sliders

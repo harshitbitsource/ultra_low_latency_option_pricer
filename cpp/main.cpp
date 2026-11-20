@@ -31,6 +31,18 @@
     return is_call ? price : price - spot + strike * discount;
 }
 
+extern "C" double option_pricer_price(
+    double spot, double strike, double rate, double maturity, double vol, int is_call
+) {
+    if (!std::isfinite(spot) || !std::isfinite(strike) || !std::isfinite(rate) ||
+        !std::isfinite(maturity) || !std::isfinite(vol) || spot <= 0.0 || strike <= 0.0 ||
+        maturity <= 0.0 || maturity > 30.0 || vol <= 0.0 || vol > 10.0 ||
+        rate < 0.0 || rate > 1.0 || (is_call != 0 && is_call != 1)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return black_scholes_call_put(spot, strike, rate, maturity, vol, is_call == 1);
+}
+
 static double parse_double(const char* name, char** argv, int argc, double default_value) {
     for (int i = 1; i < argc - 1; ++i) {
         if (std::string(argv[i]) == name) {

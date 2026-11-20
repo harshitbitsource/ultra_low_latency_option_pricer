@@ -1,0 +1,20 @@
+.vol-legend .marker {
+  display: inline-block;
+  width: 8px;
+  height: 11px;
+  margin: 0 7px 0 4px;
+  border-left: 2px dashed currentColor;
+  vertical-align: -2px;
+}
+
+.vol-legend .purple-marker {
+  color: var(--purple);
+}
+
+.vol-legend .green-marker {
+  color: var(--green);
+}
+
+.vol-legend .blue-line {
+  border-color: var(--blue);
+}

@@ -1,4 +1,5 @@
 import csv
+import ctypes
 import io
 import json
 import logging
@@ -10,9 +11,12 @@ import statistics
 import subprocess
 import threading
 import time
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, TypeVar
 from urllib.error import HTTPError, URLError
@@ -31,12 +35,22 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 CPP_DIR = ROOT / "cpp"
 BINARY_PATH = CPP_DIR / "option_pricer"
+SHARED_LIBRARY_PATH = CPP_DIR / "liboption_pricer.so"
 FRONTEND_DIR = ROOT / "frontend"
+
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI) -> AsyncIterator[None]:
+    build_pricer()
+    _load_native_library()
+    yield
+
 
 app = FastAPI(
     title="Ultra Low Latency Option Pricer",
     description="Lightweight backend using NSEPython for NSE equity quotes and ccxt for crypto quotes.",
     version="1.0",
+    lifespan=app_lifespan,
 )
 
 
@@ -345,6 +359,8 @@ def parse_yahoo_chart_payload(payload: dict, symbol: str) -> dict:
         "change": change,
         "currency": meta.get("currency"),
         "series": series,
+        "historyStatus": "available" if series else "unavailable",
+        "historySource": "Yahoo Finance",
         "raw": payload,
     }
 
@@ -368,28 +384,61 @@ _pricer_build_lock = threading.Lock()
 
 
 def build_pricer() -> None:
-    """Ensure the native pricing binary is available.
+    """Ensure the native pricing CLI and shared library are available.
 
     In a packaged/Docker runtime only the prebuilt binary is shipped (no C++
-    source or toolchain).  In that case the existing binary is used as-is and we
-    never stat a missing source or attempt a rebuild.  A rebuild is only run when
-    the source exists and the binary is missing or older than the source, and it
-    is serialized so concurrent requests cannot invoke `make` at the same time.
+    source or toolchain). In that case the existing files are used as-is. A
+    rebuild is only run when source exists and either output is missing or stale.
     """
     source_path = CPP_DIR / "main.cpp"
     with _pricer_build_lock:
         source_exists = source_path.exists()
         needs_build = source_exists and (
-            not BINARY_PATH.exists() or BINARY_PATH.stat().st_mtime < source_path.stat().st_mtime
+            not BINARY_PATH.exists()
+            or not SHARED_LIBRARY_PATH.exists()
+            or BINARY_PATH.stat().st_mtime < source_path.stat().st_mtime
+            or SHARED_LIBRARY_PATH.stat().st_mtime < source_path.stat().st_mtime
         )
         if needs_build:
             subprocess.run(["make"], cwd=CPP_DIR, check=True)
-        if not BINARY_PATH.exists():
-            raise RuntimeError("Pricing binary is unavailable and cannot be built (no C++ source/toolchain)")
+        if not BINARY_PATH.exists() or not SHARED_LIBRARY_PATH.exists():
+            raise RuntimeError("Native pricing engine is unavailable and cannot be built (no C++ source/toolchain)")
+
+
+_native_library: ctypes.CDLL | None = None
+_native_library_lock = threading.Lock()
+
+
+def _load_native_library() -> ctypes.CDLL:
+    global _native_library
+    with _native_library_lock:
+        if _native_library is None:
+            library = ctypes.CDLL(str(SHARED_LIBRARY_PATH))
+            price_function = library.option_pricer_price
+            price_function.argtypes = [
+                ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                ctypes.c_double, ctypes.c_double, ctypes.c_int,
+            ]
+            price_function.restype = ctypes.c_double
+            _native_library = library
+        return _native_library
+
+
+def native_black_scholes_price(
+    spot: float, strike: float, rate: float, maturity: float, vol: float, option_type: str
+) -> float:
+    """Price a single option through the in-process native C++ engine."""
+    build_pricer()
+    library = _load_native_library()
+    price_function = library.option_pricer_price
+    price = price_function(spot, strike, rate, maturity, vol, int(option_type == "call"))
+    if not math.isfinite(price):
+        raise ValueError("Native pricing engine rejected the inputs")
+    return price
 
 
 def parse_engine_output(output: str) -> dict:
-    data = {}
+    data: dict[str, float | str] = {}
     for line in output.strip().splitlines():
         if "=" not in line:
             continue
@@ -562,6 +611,36 @@ def _series_closes(series: list[dict] | None) -> list[float]:
     return closes
 
 
+def _series_log_returns(series: list[dict] | None) -> list[float]:
+    if not isinstance(series, list):
+        return []
+    observations = []
+    for item in series:
+        if not isinstance(item, dict):
+            continue
+        close = safe_float(item.get("close"))
+        if close is not None and close > 0:
+            observations.append((close, safe_float(item.get("ts"))))
+    if len(observations) < 2:
+        return []
+
+    intervals = [
+        current[1] - previous[1]
+        for previous, current in zip(observations, observations[1:])
+        if previous[1] is not None and current[1] is not None and current[1] > previous[1]
+    ]
+    cadence = statistics.median(intervals) if intervals else None
+    max_intraday_gap = cadence * 1.5 if cadence is not None and cadence < 24 * 60 * 60 else None
+
+    returns = []
+    for previous, current in zip(observations, observations[1:]):
+        if max_intraday_gap is not None and previous[1] is not None and current[1] is not None:
+            if current[1] - previous[1] > max_intraday_gap:
+                continue
+        returns.append(math.log(current[0] / previous[0]))
+    return returns
+
+
 def _annualization_factor(series: list[dict] | None) -> int:
     """Estimate observations per year for timestamped intraday NSE bars.
 
@@ -585,16 +664,7 @@ def _annualization_factor(series: list[dict] | None) -> int:
 
 
 def calculate_realized_vol(series: list[dict] | None, annualization: int | None = None) -> float:
-    closes = _series_closes(series)
-    if len(closes) < 2:
-        return 0.0
-    returns = []
-    for idx in range(1, len(closes)):
-        prev = closes[idx - 1]
-        current = closes[idx]
-        if prev <= 0 or current <= 0:
-            continue
-        returns.append(math.log(current / prev))
+    returns = _series_log_returns(series)
     if not returns:
         return 0.0
     # Auto-detect the observations-per-year from the series cadence unless the
@@ -645,15 +715,7 @@ def calculate_ewma_vol(series: list[dict] | None, lam: float = 0.94) -> float:
     most recent observations carry more weight, then annualizes with the same
     cadence-derived factor as the realized/GK estimators.
     """
-    closes = _series_closes(series)
-    if len(closes) < 2:
-        return 0.0
-    returns = []
-    for idx in range(1, len(closes)):
-        prev = closes[idx - 1]
-        current = closes[idx]
-        if prev > 0 and current > 0:
-            returns.append(math.log(current / prev))
+    returns = _series_log_returns(series)
     if not returns:
         return 0.0
     variance = returns[0] * returns[0]
@@ -663,18 +725,25 @@ def calculate_ewma_vol(series: list[dict] | None, lam: float = 0.94) -> float:
 
 
 def build_volatility_summary(series: list[dict] | None, iv: float) -> dict:
-    realized = calculate_realized_vol(series)
-    gk = calculate_gk_vol(series) or realized
-    ewma = calculate_ewma_vol(series)
-    if not ewma:
-        ewma = realized if realized else max(iv, 0.01)
-    ratio = (iv / realized) if realized else 0.0
-    if realized and ratio > 1.5:
+    returns_available = bool(_series_log_returns(series))
+    realized = calculate_realized_vol(series) if returns_available else None
+    valid_ohlc_bars = sum(
+        1 for item in (series or [])
+        if isinstance(item, dict)
+        and all(safe_float(item.get(key)) is not None for key in ("open", "high", "low", "close"))
+    )
+    gk = calculate_gk_vol(series) if valid_ohlc_bars >= 2 else None
+    ewma = calculate_ewma_vol(series) if returns_available else None
+    ratio = (iv / realized) if realized is not None and realized > 0 else None
+    if ratio is not None and ratio > 1.5:
         regime = "rich"
         signal = "sell"
-    elif realized and ratio < 0.7:
+    elif ratio is not None and ratio < 0.7:
         regime = "cheap"
         signal = "buy"
+    elif ratio is None:
+        regime = "unavailable"
+        signal = "neutral"
     else:
         regime = "balanced"
         signal = "neutral"
@@ -682,10 +751,10 @@ def build_volatility_summary(series: list[dict] | None, iv: float) -> dict:
         "realizedVol": realized,
         "gkVol": gk,
         "ewmaVol": ewma,
-        "forward30d": round(ewma * math.sqrt(30 / 365), 4),
+        "forward30d": round(ewma * math.sqrt(30 / 365), 4) if ewma is not None else None,
         "regime": regime,
         "signal": signal,
-        "ivVsRealized": round(ratio, 3),
+        "ivVsRealized": round(ratio, 3) if ratio is not None else None,
     }
 
 
@@ -843,7 +912,8 @@ def strategy_metrics(position: dict, strike: float, strategy: str) -> dict:
 def build_strategy_surface(spot: float, strike: float, rate: float, maturity: float,
                            vol: float, strategy: str) -> list[dict]:
     rows = []
-    for dte in (7, 30, 90, 180):
+    expiries = sorted({max(1, int(maturity * 365 * fraction + 0.5)) for fraction in (0.25, 0.5, 0.75, 1.0)})
+    for dte in expiries:
         for multiplier in (0.85, 0.925, 1.0, 1.075, 1.15):
             row_strike = strike * multiplier
             position = build_strategy_position(spot, row_strike, rate, dte / 365, vol, strategy)
@@ -880,16 +950,19 @@ def build_dashboard_payload(
     option_type: str,
     series: list[dict] | None,
 ) -> dict:
+    analytics_start = time.perf_counter()
     bs = black_scholes_price_and_greeks(spot, strike, rate, maturity, vol, option_type)
+    bs["price"] = native_black_scholes_price(spot, strike, rate, maturity, vol, option_type)
     binomial = binomial_tree_price(spot, strike, rate, maturity, vol, option_type)
     # There is no licensed option-chain feed in this deployment.  These values
     # are intentionally model-derived scenario estimates, never market quotes.
     estimated_price = bs["price"] * (1 + 0.04 * (1 - min(abs(spot - strike) / max(spot, 1.0), 0.8)))
     estimated_iv = solve_implied_volatility(estimated_price, spot, strike, rate, maturity, option_type)
     volatility = build_volatility_summary(series, vol)
-    model_start = time.perf_counter()
+    monte_carlo_start = time.perf_counter()
     mc = monte_carlo_price(spot, strike, rate, maturity, vol, option_type)
-    analytics_ms = round((time.perf_counter() - model_start) * 1000, 3)
+    monte_carlo_ms = round((time.perf_counter() - monte_carlo_start) * 1000, 3)
+    analytics_ms = round((time.perf_counter() - analytics_start) * 1000, 3)
     return {
         "modelPrice": round(bs["price"], 4),
         "marketPrice": round(estimated_price, 4),  # Backwards-compatible alias; see marketData metadata.
@@ -901,7 +974,11 @@ def build_dashboard_payload(
             "binomialAmerican": binomial,
             "monteCarloAntithetic": mc,
         },
-        "latency": {"analyticsMs": analytics_ms, "note": "Browser/network time is excluded."},
+        "latency": {
+            "analyticsMs": analytics_ms,
+            "monteCarloMs": monte_carlo_ms,
+            "note": "In-process pricing time; browser and network time are excluded.",
+        },
         "greeks": bs,
         "volatility": volatility,
         "impliedVol": {
@@ -1050,10 +1127,20 @@ def fetch_nse_stock_quote(symbol: str) -> dict:
     def load() -> dict:
         for fetch_fn in (nse_quote, nse_eq):
             try:
-                payload = provider_call("nse", lambda fn=fetch_fn: fn(symbol_value))
+                payload = provider_call("nse", partial(fetch_fn, symbol_value))
                 if payload and isinstance(payload, dict):
                     quote = parse_stock_quote_payload(payload, symbol_value)
                     quote.update({"source": "NSE via NSEPython", "dataStatus": "provider", "asOf": utc_now()})
+                    try:
+                        history = fetch_yahoo_equity_quote(symbol_value)
+                        quote["series"] = history.get("series", [])
+                        quote["historySource"] = history.get("historySource", "Yahoo Finance")
+                        quote["historyStatus"] = "available" if quote["series"] else "unavailable"
+                    except (ProviderError, ValueError) as exc:
+                        log_event("quote_history_failure", provider="yahoo", error_type=type(exc).__name__)
+                        quote["series"] = []
+                        quote["historyStatus"] = "unavailable"
+                        quote["historyMessage"] = "The quote loaded, but historical bars could not be fetched."
                     return quote
             except (ProviderError, ValueError):
                 continue
@@ -1202,7 +1289,10 @@ def health_check() -> dict:
 @app.get("/ready")
 def readiness_check() -> dict:
     """Readiness is local-only: external providers are intentionally not probed."""
-    return {"status": "ready", "pricingEnginePresent": BINARY_PATH.exists()}
+    return {
+        "status": "ready" if BINARY_PATH.exists() and SHARED_LIBRARY_PATH.exists() else "not_ready",
+        "pricingEnginePresent": BINARY_PATH.exists() and SHARED_LIBRARY_PATH.exists(),
+    }
 
 
 if (FRONTEND_DIR / "index.html").exists():
